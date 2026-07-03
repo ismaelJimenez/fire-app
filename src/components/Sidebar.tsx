@@ -14,6 +14,7 @@ interface Props {
 export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
   const { accounts, refreshAll, toast } = useStore();
   const [editing, setEditing] = useState<Account | "new" | null>(null);
+  const [deleting, setDeleting] = useState<Account | null>(null);
   const [name, setName] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -47,18 +48,20 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
     }
   }
 
-  async function remove(acc: Account) {
-    const ok = window.confirm(
-      `Delete account “${acc.name}” and its ${acc.tx_count} transaction(s)? This cannot be undone.`,
-    );
-    if (!ok) return;
+  async function remove() {
+    if (!deleting) return;
+    const acc = deleting;
+    setSaving(true);
     try {
       await api.deleteAccount(acc.id);
       toast(`Account “${acc.name}” deleted`);
       if (selectedAccountId === acc.id) onNavigate("transactions", null);
       await refreshAll();
+      setDeleting(null);
     } catch (err) {
       toast(String(err), "error");
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -131,7 +134,7 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
           </button>
           <button
             className="icon-btn danger"
-            onClick={() => remove(acc)}
+            onClick={() => setDeleting(acc)}
             title="Delete"
           >
             🗑
@@ -168,6 +171,32 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
               placeholder="e.g. Checking, Savings, Credit Card"
             />
           </div>
+        </Modal>
+      )}
+
+      {deleting && (
+        <Modal
+          title="Delete account"
+          onClose={() => setDeleting(null)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setDeleting(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn danger"
+                onClick={remove}
+                disabled={saving}
+              >
+                Delete
+              </button>
+            </>
+          }
+        >
+          <p>
+            Delete account “{deleting.name}” and its {deleting.tx_count}{" "}
+            transaction(s)? This cannot be undone.
+          </p>
         </Modal>
       )}
     </aside>

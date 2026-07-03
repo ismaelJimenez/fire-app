@@ -3,6 +3,7 @@ import { useStore } from "../store";
 import * as api from "../api";
 import { formatDate, formatMoney } from "../format";
 import { TransactionForm } from "./TransactionForm";
+import { Modal } from "./Modal";
 import type { Transaction } from "../types";
 
 interface Props {
@@ -16,6 +17,8 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<Transaction | "new" | null>(null);
+  const [deleting, setDeleting] = useState<Transaction | null>(null);
+  const [removing, setRemoving] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -62,14 +65,18 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
     }
   }
 
-  async function remove(tx: Transaction) {
-    if (!window.confirm("Delete this transaction?")) return;
+  async function remove() {
+    if (!deleting) return;
+    setRemoving(true);
     try {
-      await api.deleteTransaction(tx.id);
+      await api.deleteTransaction(deleting.id);
       toast("Transaction deleted");
       await afterMutation();
+      setDeleting(null);
     } catch (err) {
       toast(String(err), "error");
+    } finally {
+      setRemoving(false);
     }
   }
 
@@ -218,7 +225,7 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                       <button
                         className="icon-btn danger"
                         title="Delete"
-                        onClick={() => remove(tx)}
+                        onClick={() => setDeleting(tx)}
                       >
                         🗑
                       </button>
@@ -238,6 +245,33 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
           onClose={() => setEditing(null)}
           onSaved={afterMutation}
         />
+      )}
+
+      {deleting && (
+        <Modal
+          title="Delete transaction"
+          onClose={() => setDeleting(null)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setDeleting(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn danger"
+                onClick={remove}
+                disabled={removing}
+              >
+                Delete
+              </button>
+            </>
+          }
+        >
+          <p>
+            Delete this transaction
+            {deleting.description ? ` (“${deleting.description}”)` : ""} for{" "}
+            {formatMoney(deleting.amount)}? This cannot be undone.
+          </p>
+        </Modal>
       )}
     </div>
   );
