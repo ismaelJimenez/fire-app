@@ -253,14 +253,14 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                     {tx.is_auto_classified &&
                       tx.category_id != null &&
                       !tx.is_verified && (
-                      <span
-                        className="badge auto"
-                        style={{ marginLeft: 6 }}
-                        title="Classified automatically from a learned payee rule"
-                      >
-                        auto
-                      </span>
-                    )}
+                        <span
+                          className="badge auto"
+                          style={{ marginLeft: 6 }}
+                          title="Classified automatically from a learned payee rule"
+                        >
+                          auto
+                        </span>
+                      )}
                   </td>
                   <td
                     className="amount"

@@ -49,6 +49,7 @@ pub fn run() {
             commands::delete_rule,
             commands::get_summary,
             commands::import_csv,
+            commands::detect_bank,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

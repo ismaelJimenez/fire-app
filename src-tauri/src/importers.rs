@@ -34,6 +34,19 @@ pub(crate) enum BankFormat {
     Canonical,
     /// ING-DiBa Girokonto "Umsatzanzeige" export.
     IngDiba,
+    /// comdirect account "Umsätze" export.
+    Comdirect,
+}
+
+impl BankFormat {
+    /// A human-readable name for surfacing the detected format in the UI.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            BankFormat::Canonical => "Canonical template",
+            BankFormat::IngDiba => "ING-DiBa",
+            BankFormat::Comdirect => "comdirect",
+        }
+    }
 }
 
 /// Guess a file's format from its content.
@@ -43,6 +56,10 @@ pub(crate) fn detect_format(text: &str) -> BankFormat {
         // ING's data header, or its file banner.
         if t.starts_with("Buchung;Wertstellungsdatum") || t.starts_with("Umsatzanzeige;") {
             return BankFormat::IngDiba;
+        }
+        // comdirect's quoted data header, or its "Umsätze <Konto>" banner.
+        if t.starts_with("\"Buchungstag\"") || t.starts_with("\"Umsätze") {
+            return BankFormat::Comdirect;
         }
     }
     BankFormat::Canonical
@@ -57,6 +74,7 @@ pub(crate) fn detect_format(text: &str) -> BankFormat {
 pub(crate) fn parse(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
     match detect_format(text) {
         BankFormat::IngDiba => parse_ing(text),
+        BankFormat::Comdirect => parse_comdirect(text),
         BankFormat::Canonical => parse_canonical(text),
     }
 }
@@ -138,11 +156,7 @@ fn parse_ing(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
         .lines()
         .position(|l| l.trim().starts_with("Buchung;Wertstellungsdatum"))
         .ok_or("Could not find the ING transaction table header")?;
-    let data: String = text
-        .lines()
-        .skip(header_pos)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let data: String = text.lines().skip(header_pos).collect::<Vec<_>>().join("\n");
 
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(b';')
@@ -207,6 +221,110 @@ fn parse_ing(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
 }
 
 // ----------------------------------------------------------------------------
+// comdirect Girokonto
+// ----------------------------------------------------------------------------
+
+/// comdirect account "Umsätze" export: `;`-delimited with every field double-quoted,
+/// German numbers (`-2.000,00`) and dates (`23.06.2026`), preceded by a metadata
+/// preamble. Unlike ING, comdirect has no dedicated counterparty column — the payee is
+/// embedded in the free-text `Buchungstext` as `Auftraggeber:`/`Empfänger: … Buchungstext:
+/// …`. We lift it out via [`comdirect_counterparty`], falling back to the transaction
+/// type (`Vorgang`) when no party is named (fees, coupons).
+fn parse_comdirect(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
+    // The data table starts at the quoted `"Buchungstag";…` header; everything above
+    // it is account metadata (banner, IBAN, balance).
+    let header_pos = text
+        .lines()
+        .position(|l| l.trim().starts_with("\"Buchungstag\""))
+        .ok_or("Could not find the comdirect transaction table header")?;
+    let data: String = text.lines().skip(header_pos).collect::<Vec<_>>().join("\n");
+
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b';')
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(data.as_bytes());
+
+    let headers = reader.headers().map_err(|e| e.to_string())?.clone();
+    let idx = |name: &str| headers.iter().position(|h| h.eq_ignore_ascii_case(name));
+    let date_i = idx("Buchungstag").ok_or("comdirect CSV is missing the 'Buchungstag' column")?;
+    let amount_i =
+        idx("Umsatz in EUR").ok_or("comdirect CSV is missing the 'Umsatz in EUR' column")?;
+    let vorgang_i = idx("Vorgang");
+    let text_i = idx("Buchungstext");
+
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for (n, record) in reader.records().enumerate() {
+        let line = n + 2;
+        let record = match record {
+            Ok(r) => r,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        // comdirect closes the table with an "Alter Kontostand" (opening balance)
+        // trailer row; it isn't a transaction, so skip it rather than report it.
+        if record.get(date_i).map(str::trim) == Some("Alter Kontostand") {
+            continue;
+        }
+
+        let date = match normalize_date(record.get(date_i).unwrap_or("").trim()) {
+            Ok(d) => d,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+        let amount_cents = match parse_de_amount_cents(record.get(amount_i).unwrap_or("").trim()) {
+            Ok(a) => a,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        let buchungstext = record
+            .get(text_i.unwrap_or(usize::MAX))
+            .unwrap_or("")
+            .trim();
+        let vorgang = record
+            .get(vorgang_i.unwrap_or(usize::MAX))
+            .unwrap_or("")
+            .trim();
+
+        rows.push(ParsedRow {
+            date,
+            amount_cents,
+            counterparty: comdirect_counterparty(buchungstext, vorgang),
+            description: normalize_concept(buchungstext),
+            category: None,
+        });
+    }
+    Ok((rows, errors))
+}
+
+/// Pull the counterparty out of a comdirect `Buchungstext`. Most entries lead with an
+/// `Auftraggeber:` or `Empfänger:` label naming the party, followed by ` Buchungstext:`
+/// and the free-text purpose — we take the text between the two. When no party is named
+/// (account fees, security coupons), fall back to the transaction type (`Vorgang`) so
+/// those rows still carry a stable classification key.
+fn comdirect_counterparty(buchungstext: &str, vorgang: &str) -> String {
+    for label in ["Auftraggeber:", "Empfänger:"] {
+        if let Some(rest) = buchungstext.strip_prefix(label) {
+            let party = match rest.find("Buchungstext:") {
+                Some(pos) => &rest[..pos],
+                None => rest,
+            };
+            return normalize_concept(party);
+        }
+    }
+    normalize_concept(vorgang)
+}
+
+// ----------------------------------------------------------------------------
 // Shared parsing helpers
 // ----------------------------------------------------------------------------
 
@@ -226,12 +344,8 @@ pub(crate) fn validate_date(date: &str) -> Result<(), String> {
 /// Accept a few common date layouts and normalize to YYYY-MM-DD.
 pub(crate) fn normalize_date(raw: &str) -> Result<String, String> {
     for fmt in [
-        "%Y-%m-%d",
-        "%d.%m.%Y", // German: 22.06.2026 (also parses 1.1.2026)
-        "%d/%m/%Y",
-        "%m/%d/%Y",
-        "%Y/%m/%d",
-        "%d-%m-%Y",
+        "%Y-%m-%d", "%d.%m.%Y", // German: 22.06.2026 (also parses 1.1.2026)
+        "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y",
     ] {
         if let Ok(d) = NaiveDate::parse_from_str(raw, fmt) {
             return Ok(d.format("%Y-%m-%d").to_string());
@@ -388,7 +502,10 @@ mod tests {
 
     #[test]
     fn normalize_concept_collapses_whitespace() {
-        assert_eq!(normalize_concept("  BMW   Car  IT GmbH "), "BMW Car IT GmbH");
+        assert_eq!(
+            normalize_concept("  BMW   Car  IT GmbH "),
+            "BMW Car IT GmbH"
+        );
         assert_eq!(normalize_concept(""), "");
     }
 
@@ -404,6 +521,12 @@ mod tests {
             detect_format("date,amount,description\n2026-01-01,-1.00,x\n"),
             BankFormat::Canonical
         );
+    }
+
+    #[test]
+    fn format_labels_are_human_readable() {
+        assert_eq!(BankFormat::IngDiba.label(), "ING-DiBa");
+        assert_eq!(BankFormat::Canonical.label(), "Canonical template");
     }
 
     // --- ING parsing ---------------------------------------------------------
@@ -448,6 +571,81 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
     fn ing_without_header_is_a_fatal_error() {
         // Trips detection via the banner but has no data header.
         let err = parse("Umsatzanzeige;x\n\nnonsense\n").unwrap_err();
+        assert!(err.contains("header"), "unexpected error: {err}");
+    }
+
+    // --- comdirect parsing ---------------------------------------------------
+
+    const COMDIRECT_SAMPLE: &str = "\
+;\n\
+\"Umsätze Girokonto\";\"Zeitraum: 01.01.2026 - 25.06.2026\";\n\
+\"Neuer Kontostand\";\"13.965,56 EUR\";\n\
+\n\
+\"Buchungstag\";\"Wertstellung (Valuta)\";\"Vorgang\";\"Buchungstext\";\"Umsatz in EUR\";\n\
+\"23.06.2026\";\"23.06.2026\";\"Lastschrift / Belastung\";\"Auftraggeber: PayPal Europe S.a.r.l. et Cie S.C.A Buchungstext: 1051100334377/PP.1929.PP/. DocMorris NV Ref. 5A2C296Z42OT5OZR/5743\";\"-43,94\";\n\
+\"22.06.2026\";\"22.06.2026\";\"Übertrag / Überweisung\";\"Empfänger: Ismael Jimenez Martinez Buchungstext: 5510000496491140-693733 Ueberweisung Ref. 042C297208NUL22Q/74265\";\"-2.000,00\";\n\
+\"01.06.2026\";\"29.05.2026\";\"Kontoführungsentgelt\";\" Buchungstext: Entgelt Visa-Kreditkarte Zeitraum: 01.05.2026 bis 31.05.2026 Ref. 852C296H2WA36TWP/640594\";\"-1,90\";\n\
+\n\
+\"Alter Kontostand\";\"12.606,89 EUR\";\n";
+
+    #[test]
+    fn detects_comdirect() {
+        assert_eq!(detect_format(COMDIRECT_SAMPLE), BankFormat::Comdirect);
+    }
+
+    #[test]
+    fn parses_comdirect_export() {
+        let (rows, errors) = parse(COMDIRECT_SAMPLE).unwrap();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(rows.len(), 3);
+
+        // Auftraggeber is lifted out as the counterparty; German date/amount parsed.
+        assert_eq!(rows[0].date, "2026-06-23");
+        assert_eq!(rows[0].amount_cents, -4394);
+        assert_eq!(rows[0].counterparty, "PayPal Europe S.a.r.l. et Cie S.C.A");
+
+        // Empfänger works the same way; thousands separator handled.
+        assert_eq!(rows[1].counterparty, "Ismael Jimenez Martinez");
+        assert_eq!(rows[1].amount_cents, -200000);
+
+        // No party named → fall back to the Vorgang (transaction type).
+        assert_eq!(rows[2].counterparty, "Kontoführungsentgelt");
+        assert_eq!(rows[2].amount_cents, -190);
+    }
+
+    #[test]
+    fn comdirect_counterparty_extraction() {
+        assert_eq!(
+            comdirect_counterparty("Auftraggeber: ACME GmbH Buchungstext: rent", "x"),
+            "ACME GmbH"
+        );
+        assert_eq!(
+            comdirect_counterparty("Empfänger: Jane Doe Buchungstext: gift", "x"),
+            "Jane Doe"
+        );
+        // No "Buchungstext:" marker: take the whole remainder.
+        assert_eq!(
+            comdirect_counterparty("Auftraggeber: Solo Party", "x"),
+            "Solo Party"
+        );
+        // No party label at all: fall back to Vorgang.
+        assert_eq!(
+            comdirect_counterparty("Buchungstext: Entgelt", "Kupon"),
+            "Kupon"
+        );
+    }
+
+    #[test]
+    fn comdirect_skips_the_balance_trailer() {
+        // The "Alter Kontostand" trailer must not surface as a bad row.
+        let (rows, errors) = parse(COMDIRECT_SAMPLE).unwrap();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn comdirect_without_header_is_a_fatal_error() {
+        let err = parse("\"Umsätze Girokonto\";x\n\nnonsense\n").unwrap_err();
         assert!(err.contains("header"), "unexpected error: {err}");
     }
 

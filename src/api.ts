@@ -72,10 +72,11 @@ export const deleteTransaction = (id: number) =>
 
 // Classification rules
 export const listRules = () => invoke<ClassificationRule[]>("list_rules");
-export const deleteRule = (id: number) =>
-  invoke<void>("delete_rule", { id });
+export const deleteRule = (id: number) => invoke<void>("delete_rule", { id });
 
 // Summary + import
 export const getSummary = () => invoke<Summary>("get_summary");
 export const importCsv = (accountId: number, csvText: string) =>
   invoke<ImportResult>("import_csv", { accountId, csvText });
+export const detectBank = (csvText: string) =>
+  invoke<string>("detect_bank", { csvText });

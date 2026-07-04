@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
 import * as api from "../api";
 import { accountSelectOptions } from "../accounts";
@@ -36,7 +36,25 @@ export function Import({ accountId, onNavigate }: Props) {
   const [drag, setDrag] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ImportResult | null>(null);
+  const [detected, setDetected] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+
+  // Surface the auto-detected bank format as the CSV changes, so a silent
+  // misdetection (an unrecognized export falling back to the canonical template)
+  // is visible before the user imports. Debounced so typing/pasting isn't chatty.
+  useEffect(() => {
+    if (!csv.trim()) {
+      setDetected(null);
+      return;
+    }
+    const id = setTimeout(() => {
+      api
+        .detectBank(csv)
+        .then(setDetected)
+        .catch(() => setDetected(null));
+    }, 250);
+    return () => clearTimeout(id);
+  }, [csv]);
 
   async function loadFile(file: File) {
     const text = await decodeFile(file);
@@ -147,6 +165,11 @@ export function Import({ accountId, onNavigate }: Props) {
                   <strong>{fileName}</strong>
                   <div className="muted">{lineCount} line(s) loaded</div>
                 </div>
+              ) : csv.trim() ? (
+                <div>
+                  <strong>Pasted CSV</strong>
+                  <div className="muted">{lineCount} line(s)</div>
+                </div>
               ) : (
                 <div>
                   <strong>Drop a .csv file here</strong>
@@ -165,6 +188,19 @@ export function Import({ accountId, onNavigate }: Props) {
                 }}
               />
             </div>
+
+            {detected && (
+              <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>
+                Detected format: <strong>{detected}</strong>
+                {detected === "Canonical template" && (
+                  <span>
+                    {" "}
+                    — if this is a bank export, it wasn’t recognized and will be
+                    read as the plain template.
+                  </span>
+                )}
+              </div>
+            )}
 
             <div className="field" style={{ marginTop: 16 }}>
               <label>…or paste CSV text</label>
@@ -275,9 +311,9 @@ export function Import({ accountId, onNavigate }: Props) {
             </p>
             <p className="muted" style={{ fontSize: 12.5 }}>
               Bank exports are detected automatically — you can drop an{" "}
-              <strong>ING-DiBa</strong> Girokonto CSV here as-is, no reformatting
-              needed. Payees you’ve categorized before are classified for you on
-              import.
+              <strong>ING-DiBa</strong> or <strong>comdirect</strong> Girokonto
+              CSV here as-is, no reformatting needed. Payees you’ve categorized
+              before are classified for you on import.
             </p>
             <button className="btn" onClick={downloadTemplate}>
               ↓ Download template

@@ -164,9 +164,7 @@ pub fn delete_account(state: State<AppState>, id: i64) -> CmdResult<()> {
 pub fn list_categories(state: State<AppState>) -> CmdResult<Vec<Category>> {
     let conn = state.db.lock().map_err(e)?;
     let mut stmt = conn
-        .prepare(
-            "SELECT id, name, is_transfer FROM categories ORDER BY name COLLATE NOCASE",
-        )
+        .prepare("SELECT id, name, is_transfer FROM categories ORDER BY name COLLATE NOCASE")
         .map_err(e)?;
     let rows = stmt
         .query_map([], |r| {
@@ -388,11 +386,7 @@ pub fn set_transaction_category(
 /// Mark a transaction reviewed (or un-review it). Verified rows are locked: they
 /// are never re-categorized by rules and are skipped as duplicates on re-import.
 #[tauri::command]
-pub fn set_transaction_verified(
-    state: State<AppState>,
-    id: i64,
-    verified: bool,
-) -> CmdResult<()> {
+pub fn set_transaction_verified(state: State<AppState>, id: i64, verified: bool) -> CmdResult<()> {
     let conn = state.db.lock().map_err(e)?;
     conn.execute(
         "UPDATE transactions SET is_verified = ?1 WHERE id = ?2",
@@ -490,8 +484,11 @@ pub fn list_rules(state: State<AppState>) -> CmdResult<Vec<ClassificationRule>> 
 #[tauri::command]
 pub fn delete_rule(state: State<AppState>, id: i64) -> CmdResult<()> {
     let conn = state.db.lock().map_err(e)?;
-    conn.execute("DELETE FROM classification_rules WHERE id = ?1", params![id])
-        .map_err(e)?;
+    conn.execute(
+        "DELETE FROM classification_rules WHERE id = ?1",
+        params![id],
+    )
+    .map_err(e)?;
     Ok(())
 }
 
@@ -561,13 +558,23 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
 ///
 /// The format is auto-detected (see `importers`): the app's own
 /// `date,amount,description,category` template, or a supported bank export such as
-/// the ING-DiBa Girokonto "Umsatzanzeige". The caller passes already-decoded text —
-/// the front end handles the file's encoding.
+/// the ING-DiBa Girokonto "Umsatzanzeige" or a comdirect account "Umsätze" export.
+/// The caller passes already-decoded text — the front end handles the file's encoding.
 ///
 /// Categories are resolved per row: an explicit `category` column wins; otherwise a
 /// learned classification rule for the row's counterparty applies; otherwise the row
 /// lands uncategorized. Rows identical to an existing transaction (same account,
 /// date, amount and description) are skipped, so re-importing the same file is safe.
+/// Report which bank format a CSV would be parsed as, without importing anything.
+///
+/// The front end calls this when a file is loaded so it can show the detected
+/// format (and make a silent misdetection — e.g. an unrecognized bank falling back
+/// to the canonical template — visible before the user imports).
+#[tauri::command]
+pub fn detect_bank(csv_text: String) -> String {
+    importers::detect_format(&csv_text).label().to_string()
+}
+
 #[tauri::command]
 pub fn import_csv(
     state: State<AppState>,
@@ -852,7 +859,9 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         upsert_rule(&conn, "Acme", two).unwrap();
         assert_eq!(lookup_rule(&conn, "Acme").unwrap(), Some(two));
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM classification_rules", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM classification_rules", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 1);
     }
@@ -893,11 +902,9 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         let conn = db::open_in_memory().unwrap();
         let acc = seed_account(&conn, "Checking");
         let transfer_cat: i64 = conn
-            .query_row(
-                "SELECT id FROM categories WHERE is_transfer = 1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM categories WHERE is_transfer = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let insert = |amount: i64, category: Option<i64>| {
             conn.execute(
