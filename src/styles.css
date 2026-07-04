@@ -17,6 +17,8 @@
   --positive-soft: #e5f5ec;
   --negative: #d13b3b;
   --negative-soft: #fbe9e9;
+  --warning: #b8791b;
+  --warning-soft: #fbf1e0;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px rgba(16, 24, 40, 0.06);
   --radius: 12px;
   --radius-sm: 8px;
@@ -40,6 +42,8 @@
     --positive-soft: #133026;
     --negative: #f26d6d;
     --negative-soft: #35201f;
+    --warning: #e0a13a;
+    --warning-soft: #2c2413;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px rgba(0, 0, 0, 0.35);
   }
 }
@@ -418,6 +422,40 @@ tr:hover .row-actions {
   background: var(--accent-soft);
   color: var(--accent);
 }
+.unverified-warning {
+  color: var(--warning);
+  font-size: 12px;
+  margin-top: 2px;
+}
+.review-count {
+  color: var(--warning, #b8860b);
+  font-weight: 500;
+}
+.badge.auto {
+  padding: 2px 7px;
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* Verified row: category is locked from rule-based changes. */
+.icon-btn.on {
+  color: var(--positive);
+}
+.cat-select:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+.cat-select:disabled:hover {
+  border-color: transparent;
+  background: transparent;
+}
+
+/* Counterparty subline under a transaction description. */
+.tx-payee {
+  color: var(--text-faint);
+  font-size: 12px;
+  margin-top: 2px;
+}
 
 /* Inline category select */
 .cat-select {
@@ -433,7 +471,14 @@ tr:hover .row-actions {
   background: var(--surface);
 }
 .cat-select.unset {
-  color: var(--text-faint);
+  color: var(--warning);
+  border-color: var(--warning);
+  background: var(--warning-soft, transparent);
+}
+.cat-warning {
+  margin-left: 6px;
+  color: var(--warning);
+  font-size: 12px;
 }
 
 /* ------------------------------ Forms ------------------------------ */

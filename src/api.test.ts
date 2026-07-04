@@ -75,7 +75,6 @@ describe("api command/argument mapping", () => {
       amount: -4290,
       description: "Groceries",
       category_id: 7,
-      is_internal_transfer: true,
     };
     api.createTransaction(tx);
     expect(mockInvoke).toHaveBeenLastCalledWith("create_transaction", {
@@ -84,7 +83,6 @@ describe("api command/argument mapping", () => {
       amount: -4290,
       description: "Groceries",
       categoryId: 7,
-      isInternalTransfer: true,
     });
 
     api.updateTransaction(9, tx);
@@ -94,19 +92,12 @@ describe("api command/argument mapping", () => {
       amount: -4290,
       description: "Groceries",
       categoryId: 7,
-      isInternalTransfer: true,
     });
 
     api.setTransactionCategory(9, null);
     expect(mockInvoke).toHaveBeenLastCalledWith("set_transaction_category", {
       id: 9,
       categoryId: null,
-    });
-
-    api.setInternalTransfer(9, false);
-    expect(mockInvoke).toHaveBeenLastCalledWith("set_internal_transfer", {
-      id: 9,
-      isInternalTransfer: false,
     });
 
     api.deleteTransaction(9);

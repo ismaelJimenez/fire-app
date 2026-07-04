@@ -1,6 +1,6 @@
-use crate::models::{Account, Category, ImportResult, Summary, Transaction};
+use crate::importers::{self, validate_date};
+use crate::models::{Account, Category, ClassificationRule, ImportResult, Summary, Transaction};
 use crate::AppState;
-use chrono::NaiveDate;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection};
 use tauri::State;
@@ -164,13 +164,16 @@ pub fn delete_account(state: State<AppState>, id: i64) -> CmdResult<()> {
 pub fn list_categories(state: State<AppState>) -> CmdResult<Vec<Category>> {
     let conn = state.db.lock().map_err(e)?;
     let mut stmt = conn
-        .prepare("SELECT id, name FROM categories ORDER BY name COLLATE NOCASE")
+        .prepare(
+            "SELECT id, name, is_transfer FROM categories ORDER BY name COLLATE NOCASE",
+        )
         .map_err(e)?;
     let rows = stmt
         .query_map([], |r| {
             Ok(Category {
                 id: r.get(0)?,
                 name: r.get(1)?,
+                is_transfer: r.get::<_, i64>(2)? != 0,
             })
         })
         .map_err(e)?;
@@ -186,6 +189,18 @@ pub fn create_category(state: State<AppState>, name: String) -> CmdResult<i64> {
 #[tauri::command]
 pub fn delete_category(state: State<AppState>, id: i64) -> CmdResult<()> {
     let conn = state.db.lock().map_err(e)?;
+    // The built-in transfer category is load-bearing for the dashboard totals and
+    // must not be deleted out from under them.
+    let is_transfer: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM categories WHERE id = ?1 AND is_transfer = 1",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(e)?;
+    if is_transfer > 0 {
+        return Err("The Transfer category is built in and can't be deleted.".into());
+    }
     // Transactions keep their row but category_id is set to NULL (ON DELETE SET NULL).
     conn.execute("DELETE FROM categories WHERE id = ?1", params![id])
         .map_err(e)?;
@@ -215,7 +230,8 @@ fn get_or_create_category(conn: &Connection, name: &str) -> CmdResult<i64> {
 // ----------------------------------------------------------------------------
 
 const TX_SELECT: &str = "SELECT t.id, t.account_id, a.name, t.date, t.amount, t.description,
-        t.category_id, c.name, t.is_internal_transfer, t.created_at
+        t.counterparty, t.category_id, c.name,
+        t.is_verified, t.is_auto_classified, t.created_at
  FROM transactions t
  JOIN accounts a ON a.id = t.account_id
  LEFT JOIN categories c ON c.id = t.category_id";
@@ -228,10 +244,12 @@ fn map_tx(r: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         date: r.get(3)?,
         amount: r.get(4)?,
         description: r.get(5)?,
-        category_id: r.get(6)?,
-        category_name: r.get(7)?,
-        is_internal_transfer: r.get::<_, i64>(8)? != 0,
-        created_at: r.get(9)?,
+        counterparty: r.get(6)?,
+        category_id: r.get(7)?,
+        category_name: r.get(8)?,
+        is_verified: r.get::<_, i64>(9)? != 0,
+        is_auto_classified: r.get::<_, i64>(10)? != 0,
+        created_at: r.get(11)?,
     })
 }
 
@@ -281,7 +299,6 @@ fn query_transactions(
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(e)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn create_transaction(
     state: State<AppState>,
@@ -290,29 +307,20 @@ pub fn create_transaction(
     amount: i64,
     description: String,
     category_id: Option<i64>,
-    is_internal_transfer: bool,
 ) -> CmdResult<i64> {
     validate_date(&date)?;
     let conn = state.db.lock().map_err(e)?;
     ensure_account_exists(&conn, account_id)?;
     conn.execute(
         "INSERT INTO transactions
-            (account_id, date, amount, description, category_id, is_internal_transfer)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            account_id,
-            date,
-            amount,
-            description.trim(),
-            category_id,
-            is_internal_transfer as i64
-        ],
+            (account_id, date, amount, description, category_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![account_id, date, amount, description.trim(), category_id],
     )
     .map_err(e)?;
     Ok(conn.last_insert_rowid())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn update_transaction(
     state: State<AppState>,
@@ -321,55 +329,74 @@ pub fn update_transaction(
     amount: i64,
     description: String,
     category_id: Option<i64>,
-    is_internal_transfer: bool,
 ) -> CmdResult<()> {
     validate_date(&date)?;
     let conn = state.db.lock().map_err(e)?;
     conn.execute(
         "UPDATE transactions
-         SET date = ?1, amount = ?2, description = ?3,
-             category_id = ?4, is_internal_transfer = ?5
-         WHERE id = ?6",
-        params![
-            date,
-            amount,
-            description.trim(),
-            category_id,
-            is_internal_transfer as i64,
-            id
-        ],
+         SET date = ?1, amount = ?2, description = ?3, category_id = ?4
+         WHERE id = ?5",
+        params![date, amount, description.trim(), category_id, id],
     )
     .map_err(e)?;
     Ok(())
 }
 
 /// Lightweight update used by the inline category picker.
+///
+/// Setting a category by hand also *teaches* a classification rule for the
+/// transaction's counterparty (its "concept"), then applies that category to every
+/// other **unverified** transaction sharing the concept. Returns how many other
+/// rows were re-classified, so the UI can report the ripple effect. Clearing the
+/// category (`None`) just clears this row and learns nothing.
 #[tauri::command]
 pub fn set_transaction_category(
     state: State<AppState>,
     id: i64,
     category_id: Option<i64>,
-) -> CmdResult<()> {
+) -> CmdResult<i64> {
     let conn = state.db.lock().map_err(e)?;
+
+    // The user's choice is authoritative for this row: mark it non-auto so it is
+    // never silently overwritten later.
     conn.execute(
-        "UPDATE transactions SET category_id = ?1 WHERE id = ?2",
+        "UPDATE transactions SET category_id = ?1, is_auto_classified = 0 WHERE id = ?2",
         params![category_id, id],
     )
     .map_err(e)?;
-    Ok(())
+
+    let Some(cat) = category_id else {
+        return Ok(0);
+    };
+
+    // Learn the rule and propagate it, keyed on this row's concept.
+    let concept: String = conn
+        .query_row(
+            "SELECT counterparty FROM transactions WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(e)?;
+    if concept.trim().is_empty() {
+        return Ok(0);
+    }
+
+    upsert_rule(&conn, &concept, cat)?;
+    apply_rule(&conn, &concept, cat, Some(id))
 }
 
-/// Toggle a transaction's "internal transfer" flag.
+/// Mark a transaction reviewed (or un-review it). Verified rows are locked: they
+/// are never re-categorized by rules and are skipped as duplicates on re-import.
 #[tauri::command]
-pub fn set_internal_transfer(
+pub fn set_transaction_verified(
     state: State<AppState>,
     id: i64,
-    is_internal_transfer: bool,
+    verified: bool,
 ) -> CmdResult<()> {
     let conn = state.db.lock().map_err(e)?;
     conn.execute(
-        "UPDATE transactions SET is_internal_transfer = ?1 WHERE id = ?2",
-        params![is_internal_transfer as i64, id],
+        "UPDATE transactions SET is_verified = ?1 WHERE id = ?2",
+        params![verified as i64, id],
     )
     .map_err(e)?;
     Ok(())
@@ -379,6 +406,91 @@ pub fn set_internal_transfer(
 pub fn delete_transaction(state: State<AppState>, id: i64) -> CmdResult<()> {
     let conn = state.db.lock().map_err(e)?;
     conn.execute("DELETE FROM transactions WHERE id = ?1", params![id])
+        .map_err(e)?;
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Classification rules
+// ----------------------------------------------------------------------------
+
+/// Return the category a concept currently maps to, if a rule exists.
+fn lookup_rule(conn: &Connection, concept: &str) -> CmdResult<Option<i64>> {
+    conn.query_row(
+        "SELECT category_id FROM classification_rules WHERE concept = ?1 COLLATE NOCASE",
+        params![concept],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(Some)
+    .or_else(|err| match err {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(e(other)),
+    })
+}
+
+/// Remember (or update) the category for a concept.
+fn upsert_rule(conn: &Connection, concept: &str, category_id: i64) -> CmdResult<()> {
+    conn.execute(
+        "INSERT INTO classification_rules (concept, category_id) VALUES (?1, ?2)
+         ON CONFLICT(concept) DO UPDATE SET category_id = excluded.category_id",
+        params![concept, category_id],
+    )
+    .map_err(e)?;
+    Ok(())
+}
+
+/// Apply a concept's category to every unverified transaction sharing it,
+/// optionally excluding one row (the one the user just set by hand). Verified rows
+/// are left untouched. Returns the number of rows changed.
+fn apply_rule(
+    conn: &Connection,
+    concept: &str,
+    category_id: i64,
+    exclude_id: Option<i64>,
+) -> CmdResult<i64> {
+    let changed = conn
+        .execute(
+            "UPDATE transactions
+             SET category_id = ?1, is_auto_classified = 1
+             WHERE counterparty = ?2 COLLATE NOCASE
+               AND is_verified = 0
+               AND id IS NOT ?3",
+            params![category_id, concept, exclude_id],
+        )
+        .map_err(e)?;
+    Ok(changed as i64)
+}
+
+#[tauri::command]
+pub fn list_rules(state: State<AppState>) -> CmdResult<Vec<ClassificationRule>> {
+    let conn = state.db.lock().map_err(e)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.id, r.concept, r.category_id, c.name
+             FROM classification_rules r
+             JOIN categories c ON c.id = r.category_id
+             ORDER BY r.concept COLLATE NOCASE",
+        )
+        .map_err(e)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ClassificationRule {
+                id: r.get(0)?,
+                concept: r.get(1)?,
+                category_id: r.get(2)?,
+                category_name: r.get(3)?,
+            })
+        })
+        .map_err(e)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(e)
+}
+
+/// Forget a learned rule. Existing transactions keep whatever category they have;
+/// only future auto-classification stops.
+#[tauri::command]
+pub fn delete_rule(state: State<AppState>, id: i64) -> CmdResult<()> {
+    let conn = state.db.lock().map_err(e)?;
+    conn.execute("DELETE FROM classification_rules WHERE id = ?1", params![id])
         .map_err(e)?;
     Ok(())
 }
@@ -396,8 +508,10 @@ pub fn get_summary(state: State<AppState>) -> CmdResult<Summary> {
 /// Core of `get_summary`, decoupled from Tauri state so it can be tested
 /// directly against a `Connection`.
 fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
-    // Internal transfers are excluded from income/expense totals but still
-    // count toward account balances.
+    // Money moved between the user's own accounts sits in the built-in transfer
+    // category (flagged `is_transfer`, not matched by name); those rows are left
+    // out of income/expense totals but still count toward balances. `IS NOT` is
+    // null-safe, so uncategorized rows (category_id IS NULL) are kept.
     let total_balance: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(amount), 0) FROM transactions",
@@ -408,7 +522,8 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
     let income: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(amount), 0) FROM transactions
-             WHERE amount > 0 AND is_internal_transfer = 0",
+             WHERE amount > 0
+               AND category_id IS NOT (SELECT id FROM categories WHERE is_transfer = 1)",
             [],
             |r| r.get(0),
         )
@@ -416,7 +531,8 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
     let expenses: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(amount), 0) FROM transactions
-             WHERE amount < 0 AND is_internal_transfer = 0",
+             WHERE amount < 0
+               AND category_id IS NOT (SELECT id FROM categories WHERE is_transfer = 1)",
             [],
             |r| r.get(0),
         )
@@ -443,14 +559,15 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
 
 /// Import a CSV document into an account.
 ///
-/// Expected header columns (case-insensitive, order-independent):
-///   date, amount, description, category (category optional)
-///   - date:   YYYY-MM-DD
-///   - amount: decimal with '.' separator; negative = expense, positive = income
-///   - category: created automatically if it does not exist
+/// The format is auto-detected (see `importers`): the app's own
+/// `date,amount,description,category` template, or a supported bank export such as
+/// the ING-DiBa Girokonto "Umsatzanzeige". The caller passes already-decoded text —
+/// the front end handles the file's encoding.
 ///
-/// Rows identical to an existing transaction (same account, date, amount and
-/// description) are skipped so re-importing the same file is safe.
+/// Categories are resolved per row: an explicit `category` column wins; otherwise a
+/// learned classification rule for the row's counterparty applies; otherwise the row
+/// lands uncategorized. Rows identical to an existing transaction (same account,
+/// date, amount and description) are skipped, so re-importing the same file is safe.
 #[tauri::command]
 pub fn import_csv(
     state: State<AppState>,
@@ -468,17 +585,7 @@ fn import_csv_into(
     account_id: i64,
     csv_text: &str,
 ) -> CmdResult<ImportResult> {
-    let mut reader = csv::ReaderBuilder::new()
-        .trim(csv::Trim::All)
-        .flexible(true)
-        .from_reader(csv_text.as_bytes());
-
-    let headers = reader.headers().map_err(e)?.clone();
-    let idx = |name: &str| headers.iter().position(|h| h.eq_ignore_ascii_case(name));
-    let date_i = idx("date").ok_or("CSV is missing a 'date' column")?;
-    let amount_i = idx("amount").ok_or("CSV is missing an 'amount' column")?;
-    let desc_i = idx("description").ok_or("CSV is missing a 'description' column")?;
-    let cat_i = idx("category");
+    let (rows, mut errors) = importers::parse(csv_text)?;
 
     let mut result = ImportResult {
         imported: 0,
@@ -487,54 +594,33 @@ fn import_csv_into(
     };
 
     let tx = conn.transaction().map_err(e)?;
-    for (n, record) in reader.records().enumerate() {
-        let line = n + 2; // +1 for header, +1 for 1-based
-        let record = match record {
-            Ok(r) => r,
-            Err(err) => {
-                result.errors.push(format!("Row {line}: {err}"));
-                continue;
-            }
-        };
-
-        let raw_date = record.get(date_i).unwrap_or("").trim();
-        let date = match normalize_date(raw_date) {
-            Ok(d) => d,
-            Err(err) => {
-                result.errors.push(format!("Row {line}: {err}"));
-                continue;
-            }
-        };
-
-        let raw_amount = record.get(amount_i).unwrap_or("").trim();
-        let amount = match parse_amount_cents(raw_amount) {
-            Ok(a) => a,
-            Err(err) => {
-                result.errors.push(format!("Row {line}: {err}"));
-                continue;
-            }
-        };
-
-        let description = record.get(desc_i).unwrap_or("").trim();
-
-        let category_id: Option<i64> = match cat_i.and_then(|i| record.get(i)).map(str::trim) {
-            Some(c) if !c.is_empty() => match get_or_create_category(&tx, c) {
-                Ok(id) => Some(id),
+    for row in &rows {
+        // Category precedence: explicit column, then a learned rule for the
+        // concept, then nothing. `is_auto_classified` marks rule-driven matches.
+        let (category_id, auto): (Option<i64>, bool) = if let Some(name) = &row.category {
+            match get_or_create_category(&tx, name) {
+                Ok(id) => (Some(id), false),
                 Err(err) => {
-                    result.errors.push(format!("Row {line}: {err}"));
-                    None
+                    errors.push(err);
+                    (None, false)
                 }
-            },
-            _ => None,
+            }
+        } else if !row.counterparty.trim().is_empty() {
+            match lookup_rule(&tx, &row.counterparty)? {
+                Some(id) => (Some(id), true),
+                None => (None, false),
+            }
+        } else {
+            (None, false)
         };
 
-        // Duplicate guard.
+        // Duplicate guard (also makes re-import of a verified row a no-op).
         let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM transactions
                  WHERE account_id = ?1 AND date = ?2 AND amount = ?3 AND description = ?4
                  LIMIT 1",
-                params![account_id, date, amount, description],
+                params![account_id, row.date, row.amount_cents, row.description],
                 |_| Ok(()),
             )
             .is_ok();
@@ -544,91 +630,26 @@ fn import_csv_into(
         }
 
         tx.execute(
-            "INSERT INTO transactions (account_id, date, amount, description, category_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![account_id, date, amount, description, category_id],
+            "INSERT INTO transactions
+                (account_id, date, amount, description, counterparty, category_id, is_auto_classified)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                account_id,
+                row.date,
+                row.amount_cents,
+                row.description,
+                row.counterparty,
+                category_id,
+                auto as i64
+            ],
         )
         .map_err(e)?;
         result.imported += 1;
     }
     tx.commit().map_err(e)?;
 
+    result.errors = errors;
     Ok(result)
-}
-
-fn validate_date(date: &str) -> CmdResult<()> {
-    NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map(|_| ())
-        .map_err(|_| format!("Invalid date \"{date}\" (expected YYYY-MM-DD)"))
-}
-
-/// Accept a few common date layouts and normalize to YYYY-MM-DD.
-fn normalize_date(raw: &str) -> CmdResult<String> {
-    for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y"] {
-        if let Ok(d) = NaiveDate::parse_from_str(raw, fmt) {
-            return Ok(d.format("%Y-%m-%d").to_string());
-        }
-    }
-    Err(format!("Invalid date \"{raw}\" (expected YYYY-MM-DD)"))
-}
-
-/// Parse a decimal amount string into integer cents.
-///
-/// Currency symbols, spaces and thousands separators are stripped first, then
-/// the remaining decimal is converted to cents using integer arithmetic so no
-/// floating-point rounding error can creep in. Mirrors `parseAmountToCents` in
-/// the front end (`src/format.ts`); keep the two in sync.
-fn parse_amount_cents(raw: &str) -> CmdResult<i64> {
-    // Strip currency symbols, spaces and thousands separators.
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '.')
-        .collect();
-    decimal_str_to_cents(&cleaned).ok_or_else(|| format!("Invalid amount \"{raw}\""))
-}
-
-/// Convert a cleaned decimal string (digits, an optional leading `-`, and at
-/// most one `.`) into integer cents, rounding half-up on the third decimal.
-/// Returns `None` for anything that is not a well-formed number.
-fn decimal_str_to_cents(s: &str) -> Option<i64> {
-    let negative = s.starts_with('-');
-    let body = s.strip_prefix('-').unwrap_or(s);
-    if body.is_empty() {
-        return None;
-    }
-
-    let mut parts = body.splitn(2, '.');
-    let int_part = parts.next().unwrap_or("");
-    let frac_part = parts.next().unwrap_or("");
-
-    // A second '.' (e.g. "1.2.3") lands inside frac_part; reject it.
-    if frac_part.contains('.') {
-        return None;
-    }
-    // Need at least one digit somewhere, and every char must be a digit.
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-    if !int_part.chars().all(|c| c.is_ascii_digit())
-        || !frac_part.chars().all(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-
-    let int_val: i64 = if int_part.is_empty() {
-        0
-    } else {
-        int_part.parse().ok()?
-    };
-
-    let digit = |i: usize| frac_part.as_bytes().get(i).map_or(0, |b| (b - b'0') as i64);
-    let mut cents = int_val.checked_mul(100)? + digit(0) * 10 + digit(1);
-    // Round half-up based on the third fractional digit, if present.
-    if digit(2) >= 5 {
-        cents += 1;
-    }
-
-    Some(if negative { -cents } else { cents })
 }
 
 // ----------------------------------------------------------------------------
@@ -639,63 +660,6 @@ fn decimal_str_to_cents(s: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::db;
-
-    // --- parse_amount_cents / decimal_str_to_cents ---------------------------
-
-    #[test]
-    fn parses_plain_decimals_without_float_error() {
-        assert_eq!(parse_amount_cents("12.34").unwrap(), 1234);
-        assert_eq!(parse_amount_cents("-12.34").unwrap(), -1234);
-        assert_eq!(parse_amount_cents("1500.00").unwrap(), 150000);
-        assert_eq!(parse_amount_cents("0.01").unwrap(), 1);
-        assert_eq!(parse_amount_cents("0").unwrap(), 0);
-        // 0.29 is the classic binary-float trap; integer parsing nails it.
-        assert_eq!(parse_amount_cents("0.29").unwrap(), 29);
-    }
-
-    #[test]
-    fn parses_partial_and_shorthand_decimals() {
-        assert_eq!(parse_amount_cents("5").unwrap(), 500);
-        assert_eq!(parse_amount_cents("5.5").unwrap(), 550);
-        assert_eq!(parse_amount_cents(".5").unwrap(), 50);
-        assert_eq!(parse_amount_cents("-.5").unwrap(), -50);
-    }
-
-    #[test]
-    fn strips_currency_symbols_and_thousands_separators() {
-        assert_eq!(parse_amount_cents("$1234.56").unwrap(), 123456);
-        assert_eq!(parse_amount_cents("€ 42.90").unwrap(), 4290);
-    }
-
-    #[test]
-    fn rounds_half_up_on_the_third_decimal() {
-        assert_eq!(parse_amount_cents("12.345").unwrap(), 1235);
-        assert_eq!(parse_amount_cents("12.344").unwrap(), 1234);
-        assert_eq!(parse_amount_cents("-12.345").unwrap(), -1235);
-    }
-
-    #[test]
-    fn rejects_malformed_amounts() {
-        for bad in ["", "-", "abc", "1.2.3", ".", "--5"] {
-            assert!(parse_amount_cents(bad).is_err(), "expected {bad:?} to fail");
-        }
-    }
-
-    // --- normalize_date / validate_date --------------------------------------
-
-    #[test]
-    fn normalizes_common_date_layouts() {
-        assert_eq!(normalize_date("2026-01-05").unwrap(), "2026-01-05");
-        assert_eq!(normalize_date("05/01/2026").unwrap(), "2026-01-05"); // DD/MM/YYYY
-        assert_eq!(normalize_date("2026/01/05").unwrap(), "2026-01-05");
-    }
-
-    #[test]
-    fn rejects_invalid_dates() {
-        assert!(normalize_date("not-a-date").is_err());
-        assert!(validate_date("2026-13-40").is_err());
-        assert!(validate_date("2026-02-15").is_ok());
-    }
 
     // --- import_csv_into (integration against a real SQLite schema) -----------
 
@@ -781,23 +745,171 @@ mod tests {
         assert!(err.contains("date"), "unexpected error: {err}");
     }
 
+    // --- ING import + classification rules -----------------------------------
+
+    const ING: &str = "Umsatzanzeige;Datei erstellt am: 26.06.2026\n\
+\n\
+Bank;ING\n\
+\n\
+Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck;Saldo;Währung;Betrag;Währung\n\
+19.06.2026;19.06.2026;BMW Car IT GmbH;Gehalt/Rente;Mai;31.021,35;EUR;5.082,40;EUR\n\
+22.05.2026;22.05.2026;BMW Car IT GmbH;Gehalt/Rente;April;25.961,86;EUR;5.082,40;EUR\n\
+02.06.2026;02.06.2026;ING;Entgelt;GIROCARD;25.960,37;EUR;-1,49;EUR\n";
+
+    fn cat(conn: &Connection, name: &str) -> i64 {
+        get_or_create_category(conn, name).unwrap()
+    }
+
+    #[test]
+    fn ing_import_parses_amounts_and_stores_counterparty() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "ING");
+        let res = import_csv_into(&mut conn, acc, ING).unwrap();
+        assert_eq!(res.imported, 3);
+        assert!(res.errors.is_empty(), "unexpected errors: {:?}", res.errors);
+        // German amount parsed to cents; counterparty captured as the concept.
+        let (amount, cp): (i64, String) = conn
+            .query_row(
+                "SELECT amount, counterparty FROM transactions WHERE description LIKE 'Gehalt%Mai'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(amount, 508240);
+        assert_eq!(cp, "BMW Car IT GmbH");
+    }
+
+    #[test]
+    fn import_auto_classifies_via_learned_rule() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "ING");
+        let income = cat(&conn, "Income");
+        upsert_rule(&conn, "BMW Car IT GmbH", income).unwrap();
+
+        import_csv_into(&mut conn, acc, ING).unwrap();
+        // Both BMW rows are auto-categorized; the ING "Entgelt" row stays unset.
+        let auto: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE category_id = ?1 AND is_auto_classified = 1",
+                params![income],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto, 2);
+        let uncat: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE category_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(uncat, 1);
+    }
+
+    #[test]
+    fn apply_rule_hits_unverified_and_skips_verified() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "ING");
+        let income = cat(&conn, "Income");
+        let insert = |desc: &str, verified: i64| {
+            conn.execute(
+                "INSERT INTO transactions
+                    (account_id, date, amount, description, counterparty, is_verified)
+                 VALUES (?1, '2026-01-01', 100, ?2, 'Acme', ?3)",
+                params![acc, desc, verified],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let a = insert("a", 0); // the row "just set" by hand
+        let b = insert("b", 0); // sibling, should be swept in
+        let c = insert("c", 1); // verified: locked
+
+        upsert_rule(&conn, "Acme", income).unwrap();
+        let changed = apply_rule(&conn, "Acme", income, Some(a)).unwrap();
+        assert_eq!(changed, 1); // only `b`
+
+        let is_null = |id: i64| {
+            conn.query_row(
+                "SELECT category_id IS NULL FROM transactions WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        assert!(is_null(a), "excluded row untouched");
+        assert!(!is_null(b), "sibling updated");
+        assert!(is_null(c), "verified row locked");
+    }
+
+    #[test]
+    fn upsert_rule_overwrites_existing_concept() {
+        let conn = db::open_in_memory().unwrap();
+        let one = cat(&conn, "Income");
+        let two = cat(&conn, "Savings");
+        upsert_rule(&conn, "Acme", one).unwrap();
+        upsert_rule(&conn, "Acme", two).unwrap();
+        assert_eq!(lookup_rule(&conn, "Acme").unwrap(), Some(two));
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM classification_rules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn verified_row_survives_reimport_as_duplicate() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "ING");
+        import_csv_into(&mut conn, acc, ING).unwrap();
+
+        // Hand-categorize and verify one row.
+        let savings = cat(&conn, "Savings");
+        conn.execute(
+            "UPDATE transactions SET is_verified = 1, category_id = ?1
+             WHERE description LIKE 'Entgelt%'",
+            params![savings],
+        )
+        .unwrap();
+
+        // Re-importing the same file changes nothing.
+        let res = import_csv_into(&mut conn, acc, ING).unwrap();
+        assert_eq!(res.imported, 0);
+        assert_eq!(res.skipped_duplicates, 3);
+        let cat_id: Option<i64> = conn
+            .query_row(
+                "SELECT category_id FROM transactions WHERE description LIKE 'Entgelt%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cat_id, Some(savings));
+    }
+
     // --- compute_summary -----------------------------------------------------
 
     #[test]
-    fn summary_excludes_internal_transfers_from_income_and_expense() {
+    fn summary_excludes_transfers_from_income_and_expense() {
         let conn = db::open_in_memory().unwrap();
         let acc = seed_account(&conn, "Checking");
-        let insert = |amount: i64, transfer: i64| {
+        let transfer_cat: i64 = conn
+            .query_row(
+                "SELECT id FROM categories WHERE is_transfer = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let insert = |amount: i64, category: Option<i64>| {
             conn.execute(
-                "INSERT INTO transactions (account_id, date, amount, is_internal_transfer)
+                "INSERT INTO transactions (account_id, date, amount, category_id)
                  VALUES (?1, '2026-01-01', ?2, ?3)",
-                params![acc, amount, transfer],
+                params![acc, amount, category],
             )
             .unwrap();
         };
-        insert(150000, 0); // income
-        insert(-42_90, 0); // expense
-        insert(-80000, 1); // internal transfer: balance only
+        insert(150000, None); // income, uncategorized
+        insert(-42_90, None); // expense, uncategorized
+        insert(-80000, Some(transfer_cat)); // transfer: balance only
 
         let s = compute_summary(&conn).unwrap();
         assert_eq!(s.income, 150000);

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
   Category,
+  ClassificationRule,
   ImportResult,
   Summary,
   Transaction,
@@ -38,7 +39,6 @@ export interface TxInput {
   amount: number;
   description: string;
   category_id: number | null;
-  is_internal_transfer: boolean;
 }
 
 export const createTransaction = (t: TxInput) =>
@@ -48,7 +48,6 @@ export const createTransaction = (t: TxInput) =>
     amount: t.amount,
     description: t.description,
     categoryId: t.category_id,
-    isInternalTransfer: t.is_internal_transfer,
   });
 
 export const updateTransaction = (id: number, t: TxInput) =>
@@ -58,17 +57,23 @@ export const updateTransaction = (id: number, t: TxInput) =>
     amount: t.amount,
     description: t.description,
     categoryId: t.category_id,
-    isInternalTransfer: t.is_internal_transfer,
   });
 
+/** Sets the category and learns/propagates a rule; resolves to how many other
+ *  (unverified) transactions with the same concept were re-classified. */
 export const setTransactionCategory = (id: number, categoryId: number | null) =>
-  invoke<void>("set_transaction_category", { id, categoryId });
+  invoke<number>("set_transaction_category", { id, categoryId });
 
-export const setInternalTransfer = (id: number, value: boolean) =>
-  invoke<void>("set_internal_transfer", { id, isInternalTransfer: value });
+export const setTransactionVerified = (id: number, verified: boolean) =>
+  invoke<void>("set_transaction_verified", { id, verified });
 
 export const deleteTransaction = (id: number) =>
   invoke<void>("delete_transaction", { id });
+
+// Classification rules
+export const listRules = () => invoke<ClassificationRule[]>("list_rules");
+export const deleteRule = (id: number) =>
+  invoke<void>("delete_rule", { id });
 
 // Summary + import
 export const getSummary = () => invoke<Summary>("get_summary");

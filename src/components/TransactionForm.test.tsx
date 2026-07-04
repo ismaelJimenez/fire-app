@@ -20,7 +20,9 @@ const accounts: Account[] = [
     tx_count: 0,
   },
 ];
-const categories: Category[] = [{ id: 7, name: "Groceries" }];
+const categories: Category[] = [
+  { id: 7, name: "Groceries", is_transfer: false },
+];
 
 const toast = vi.fn();
 const mockStore = { accounts, categories, toast };

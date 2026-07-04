@@ -14,6 +14,9 @@ interface Props {
 
 export function Transactions({ accountId, onSelectAccount }: Props) {
   const { accounts, categories, refreshAll, toast } = useStore();
+  // Transfers are identified by the built-in category's id, not its name, so a
+  // rename never breaks the badge.
+  const transferCategoryId = categories.find((c) => c.is_transfer)?.id ?? null;
   const [rows, setRows] = useState<Transaction[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -21,16 +24,22 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
   const [deleting, setDeleting] = useState<Transaction | null>(null);
   const [removing, setRemoving] = useState(false);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      setRows(await api.listTransactions(accountId, search));
-    } catch (err) {
-      toast(String(err), "error");
-    } finally {
-      setLoading(false);
-    }
-  }, [accountId, search, toast]);
+  // `silent` refreshes the rows in place without flipping the loading state,
+  // which would unmount the table and reset the scroll position — jarring when
+  // verifying rows one after another.
+  const load = useCallback(
+    async (silent = false) => {
+      if (!silent) setLoading(true);
+      try {
+        setRows(await api.listTransactions(accountId, search));
+      } catch (err) {
+        toast(String(err), "error");
+      } finally {
+        if (!silent) setLoading(false);
+      }
+    },
+    [accountId, search, toast],
+  );
 
   // Debounce search; reload on account change.
   useEffect(() => {
@@ -39,27 +48,28 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
   }, [load, search]);
 
   async function afterMutation() {
-    await Promise.all([load(), refreshAll()]);
+    await Promise.all([load(true), refreshAll()]);
   }
 
   async function changeCategory(tx: Transaction, value: string) {
     const categoryId = value ? Number(value) : null;
     try {
-      await api.setTransactionCategory(tx.id, categoryId);
+      const propagated = await api.setTransactionCategory(tx.id, categoryId);
+      if (propagated > 0) {
+        toast(
+          `Learned this payee — also classified ${propagated} matching transaction(s)`,
+        );
+      }
       await afterMutation();
     } catch (err) {
       toast(String(err), "error");
     }
   }
 
-  async function toggleTransfer(tx: Transaction) {
+  async function toggleVerified(tx: Transaction) {
     try {
-      await api.setInternalTransfer(tx.id, !tx.is_internal_transfer);
-      toast(
-        !tx.is_internal_transfer
-          ? "Marked as internal transfer"
-          : "Unmarked as transfer",
-      );
+      await api.setTransactionVerified(tx.id, !tx.is_verified);
+      toast(tx.is_verified ? "Marked as unverified" : "Marked as verified");
       await afterMutation();
     } catch (err) {
       toast(String(err), "error");
@@ -82,6 +92,8 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
   }
 
   const activeAccount = accounts.find((a) => a.id === accountId) ?? null;
+  const unverifiedCount = rows.filter((tx) => !tx.is_verified).length;
+  const uncategorizedCount = rows.filter((tx) => tx.category_id == null).length;
 
   return (
     <div>
@@ -92,6 +104,23 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
             {activeAccount ? `Showing ${activeAccount.name}` : "All accounts"}
             {" · "}
             {rows.length} shown
+            {uncategorizedCount > 0 && (
+              <>
+                {" · "}
+                <span className="review-count">
+                  <span aria-hidden="true">⚠</span> {uncategorizedCount}{" "}
+                  uncategorized
+                </span>
+              </>
+            )}
+            {unverifiedCount > 0 && (
+              <>
+                {" · "}
+                <span className="review-count">
+                  <span aria-hidden="true">⚠</span> {unverifiedCount} unverified
+                </span>
+              </>
+            )}
           </p>
         </div>
         <button
@@ -167,14 +196,28 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                     <td className="muted">{tx.account_name}</td>
                   )}
                   <td>
-                    {tx.description || <span className="muted">—</span>}
-                    {tx.is_internal_transfer && (
-                      <span
-                        className="badge transfer"
-                        style={{ marginLeft: 8 }}
+                    <div>
+                      {tx.description || <span className="muted">—</span>}
+                      {transferCategoryId != null &&
+                        tx.category_id === transferCategoryId && (
+                          <span
+                            className="badge transfer"
+                            style={{ marginLeft: 8 }}
+                          >
+                            ⇄ transfer
+                          </span>
+                        )}
+                    </div>
+                    {tx.counterparty && (
+                      <div className="tx-payee">{tx.counterparty}</div>
+                    )}
+                    {!tx.is_verified && (
+                      <div
+                        className="unverified-warning"
+                        title="Not yet verified"
                       >
-                        ⇄ transfer
-                      </span>
+                        <span aria-hidden="true">⚠</span> unverified
+                      </div>
                     )}
                   </td>
                   <td>
@@ -183,6 +226,12 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                         "cat-select" + (tx.category_id ? "" : " unset")
                       }
                       value={tx.category_id ?? ""}
+                      disabled={tx.is_verified}
+                      title={
+                        tx.is_verified
+                          ? "Verified — unverify to change the category"
+                          : undefined
+                      }
                       onChange={(e) => changeCategory(tx, e.target.value)}
                     >
                       <option value="">Uncategorized</option>
@@ -192,6 +241,26 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                         </option>
                       ))}
                     </select>
+                    {tx.category_id == null && (
+                      <span
+                        className="cat-warning"
+                        title="Uncategorized"
+                        aria-label="Uncategorized"
+                      >
+                        ⚠
+                      </span>
+                    )}
+                    {tx.is_auto_classified &&
+                      tx.category_id != null &&
+                      !tx.is_verified && (
+                      <span
+                        className="badge auto"
+                        style={{ marginLeft: 6 }}
+                        title="Classified automatically from a learned payee rule"
+                      >
+                        auto
+                      </span>
+                    )}
                   </td>
                   <td
                     className="amount"
@@ -205,15 +274,15 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                   <td>
                     <div className="row-actions">
                       <button
-                        className="icon-btn"
+                        className={"icon-btn" + (tx.is_verified ? " on" : "")}
                         title={
-                          tx.is_internal_transfer
-                            ? "Unmark transfer"
-                            : "Mark as internal transfer"
+                          tx.is_verified
+                            ? "Verified — click to unverify"
+                            : "Mark as verified (reviewed)"
                         }
-                        onClick={() => toggleTransfer(tx)}
+                        onClick={() => toggleVerified(tx)}
                       >
-                        ⇄
+                        ✓
                       </button>
                       <button
                         className="icon-btn"

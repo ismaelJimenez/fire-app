@@ -1,0 +1,490 @@
+//! Turning bank CSV exports into a common shape.
+//!
+//! Every bank exports a different dialect — different delimiters, encodings,
+//! number and date formats, and a pile of preamble lines before the real header.
+//! This module hides those differences behind [`parse`], which sniffs the format
+//! and returns a flat list of [`ParsedRow`]s plus any per-row errors. The database
+//! side (`commands::import_csv_into`) stays oblivious to which bank a file came
+//! from.
+//!
+//! Adding a bank is a new [`BankFormat`] arm, a `parse_*` function, and a signature
+//! in [`detect_format`] — no schema or UI change.
+
+use chrono::NaiveDate;
+
+/// One transaction lifted out of a CSV, normalized to the app's conventions:
+/// ISO date, integer cents, and a trimmed counterparty ("concept").
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParsedRow {
+    pub date: String,
+    /// Amount in cents; negative = expense.
+    pub amount_cents: i64,
+    /// The payee/counterparty that drives auto-classification. May be empty.
+    pub counterparty: String,
+    pub description: String,
+    /// An explicit category named in the file (canonical format only). Bank
+    /// exports leave this `None` and rely on learned classification rules.
+    pub category: Option<String>,
+}
+
+/// The CSV dialects we know how to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BankFormat {
+    /// The app's own `date,amount,description,category` template.
+    Canonical,
+    /// ING-DiBa Girokonto "Umsatzanzeige" export.
+    IngDiba,
+}
+
+/// Guess a file's format from its content.
+pub(crate) fn detect_format(text: &str) -> BankFormat {
+    for line in text.lines() {
+        let t = line.trim();
+        // ING's data header, or its file banner.
+        if t.starts_with("Buchung;Wertstellungsdatum") || t.starts_with("Umsatzanzeige;") {
+            return BankFormat::IngDiba;
+        }
+    }
+    BankFormat::Canonical
+}
+
+/// Parse a decoded CSV document.
+///
+/// `Err` is a fatal, whole-file problem (unrecognized/unreadable header). `Ok`
+/// carries the successfully parsed rows plus a per-row error for each line that
+/// could not be read — mirroring the "report bad rows but keep going" behavior of
+/// the original importer.
+pub(crate) fn parse(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
+    match detect_format(text) {
+        BankFormat::IngDiba => parse_ing(text),
+        BankFormat::Canonical => parse_canonical(text),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Canonical (the app's own template)
+// ----------------------------------------------------------------------------
+
+/// `date,amount,description,category` with header-matched, order-independent
+/// columns. Amounts use a `.` decimal separator; `category` is optional.
+fn parse_canonical(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(text.as_bytes());
+
+    let headers = reader.headers().map_err(|e| e.to_string())?.clone();
+    let idx = |name: &str| headers.iter().position(|h| h.eq_ignore_ascii_case(name));
+    let date_i = idx("date").ok_or("CSV is missing a 'date' column")?;
+    let amount_i = idx("amount").ok_or("CSV is missing an 'amount' column")?;
+    let desc_i = idx("description").ok_or("CSV is missing a 'description' column")?;
+    let cat_i = idx("category");
+
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for (n, record) in reader.records().enumerate() {
+        let line = n + 2; // +1 header, +1 for 1-based
+        let record = match record {
+            Ok(r) => r,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        let date = match normalize_date(record.get(date_i).unwrap_or("").trim()) {
+            Ok(d) => d,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+        let amount_cents = match parse_amount_cents(record.get(amount_i).unwrap_or("").trim()) {
+            Ok(a) => a,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+        let category = cat_i
+            .and_then(|i| record.get(i))
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
+
+        rows.push(ParsedRow {
+            date,
+            amount_cents,
+            counterparty: String::new(),
+            description: record.get(desc_i).unwrap_or("").trim().to_string(),
+            category,
+        });
+    }
+    Ok((rows, errors))
+}
+
+// ----------------------------------------------------------------------------
+// ING-DiBa Girokonto
+// ----------------------------------------------------------------------------
+
+/// ING-DiBa "Umsatzanzeige": `;`-delimited, German numbers (`-5.000,00`) and dates
+/// (`22.06.2026`), preceded by a metadata preamble. The counterparty comes from the
+/// "Auftraggeber/Empfänger" column; the description joins "Buchungstext" and
+/// "Verwendungszweck".
+fn parse_ing(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
+    // The data table starts at the "Buchung;Wertstellungsdatum;…" line; everything
+    // above it is account metadata.
+    let header_pos = text
+        .lines()
+        .position(|l| l.trim().starts_with("Buchung;Wertstellungsdatum"))
+        .ok_or("Could not find the ING transaction table header")?;
+    let data: String = text
+        .lines()
+        .skip(header_pos)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b';')
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(data.as_bytes());
+
+    let headers = reader.headers().map_err(|e| e.to_string())?.clone();
+    let idx = |name: &str| headers.iter().position(|h| h.eq_ignore_ascii_case(name));
+    let date_i = idx("Buchung").ok_or("ING CSV is missing the 'Buchung' column")?;
+    let amount_i = idx("Betrag").ok_or("ING CSV is missing the 'Betrag' column")?;
+    let payee_i = idx("Auftraggeber/Empfänger");
+    let text_i = idx("Buchungstext");
+    let purpose_i = idx("Verwendungszweck");
+
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for (n, record) in reader.records().enumerate() {
+        let line = n + 2;
+        let record = match record {
+            Ok(r) => r,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        let date = match normalize_date(record.get(date_i).unwrap_or("").trim()) {
+            Ok(d) => d,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+        let amount_cents = match parse_de_amount_cents(record.get(amount_i).unwrap_or("").trim()) {
+            Ok(a) => a,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        let counterparty =
+            normalize_concept(payee_i.and_then(|i| record.get(i)).unwrap_or("").trim());
+        let get = |i: Option<usize>| i.and_then(|i| record.get(i)).unwrap_or("").trim();
+        let description = [get(text_i), get(purpose_i)]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        rows.push(ParsedRow {
+            date,
+            amount_cents,
+            counterparty,
+            description,
+            category: None,
+        });
+    }
+    Ok((rows, errors))
+}
+
+// ----------------------------------------------------------------------------
+// Shared parsing helpers
+// ----------------------------------------------------------------------------
+
+/// Collapse a counterparty string into a stable "concept" key: trimmed with runs
+/// of whitespace reduced to single spaces. Used both as the value stored on a
+/// transaction and as the classification-rule key.
+pub(crate) fn normalize_concept(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(crate) fn validate_date(date: &str) -> Result<(), String> {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|_| ())
+        .map_err(|_| format!("Invalid date \"{date}\" (expected YYYY-MM-DD)"))
+}
+
+/// Accept a few common date layouts and normalize to YYYY-MM-DD.
+pub(crate) fn normalize_date(raw: &str) -> Result<String, String> {
+    for fmt in [
+        "%Y-%m-%d",
+        "%d.%m.%Y", // German: 22.06.2026 (also parses 1.1.2026)
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+    ] {
+        if let Ok(d) = NaiveDate::parse_from_str(raw, fmt) {
+            return Ok(d.format("%Y-%m-%d").to_string());
+        }
+    }
+    Err(format!("Invalid date \"{raw}\" (expected YYYY-MM-DD)"))
+}
+
+/// Parse a decimal amount that uses a `.` decimal separator (the canonical format)
+/// into integer cents.
+pub(crate) fn parse_amount_cents(raw: &str) -> Result<i64, String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '.')
+        .collect();
+    decimal_str_to_cents(&cleaned).ok_or_else(|| format!("Invalid amount \"{raw}\""))
+}
+
+/// Parse a German-formatted amount (`.` thousands, `,` decimals — e.g. `-5.000,00`)
+/// into integer cents.
+pub(crate) fn parse_de_amount_cents(raw: &str) -> Result<i64, String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '.' || *c == ',')
+        .collect();
+    // Thousands dots drop out; the decimal comma becomes a point.
+    let normalized = cleaned.replace('.', "").replace(',', ".");
+    decimal_str_to_cents(&normalized).ok_or_else(|| format!("Invalid amount \"{raw}\""))
+}
+
+/// Convert a cleaned decimal string (digits, an optional leading `-`, and at most
+/// one `.`) into integer cents, rounding half-up on the third decimal. Returns
+/// `None` for anything that is not a well-formed number.
+///
+/// Mirrors `parseAmountToCents` in the front end (`src/format.ts`); keep in sync.
+pub(crate) fn decimal_str_to_cents(s: &str) -> Option<i64> {
+    let negative = s.starts_with('-');
+    let body = s.strip_prefix('-').unwrap_or(s);
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut parts = body.splitn(2, '.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next().unwrap_or("");
+
+    // A second '.' (e.g. "1.2.3") lands inside frac_part; reject it.
+    if frac_part.contains('.') {
+        return None;
+    }
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let int_val: i64 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+
+    let digit = |i: usize| frac_part.as_bytes().get(i).map_or(0, |b| (b - b'0') as i64);
+    let mut cents = int_val.checked_mul(100)? + digit(0) * 10 + digit(1);
+    if digit(2) >= 5 {
+        cents += 1;
+    }
+
+    Some(if negative { -cents } else { cents })
+}
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- amount parsing ------------------------------------------------------
+
+    #[test]
+    fn parses_plain_decimals_without_float_error() {
+        assert_eq!(parse_amount_cents("12.34").unwrap(), 1234);
+        assert_eq!(parse_amount_cents("-12.34").unwrap(), -1234);
+        assert_eq!(parse_amount_cents("1500.00").unwrap(), 150000);
+        assert_eq!(parse_amount_cents("0.01").unwrap(), 1);
+        assert_eq!(parse_amount_cents("0").unwrap(), 0);
+        assert_eq!(parse_amount_cents("0.29").unwrap(), 29);
+    }
+
+    #[test]
+    fn parses_partial_and_shorthand_decimals() {
+        assert_eq!(parse_amount_cents("5").unwrap(), 500);
+        assert_eq!(parse_amount_cents("5.5").unwrap(), 550);
+        assert_eq!(parse_amount_cents(".5").unwrap(), 50);
+        assert_eq!(parse_amount_cents("-.5").unwrap(), -50);
+    }
+
+    #[test]
+    fn strips_currency_symbols_and_thousands_separators() {
+        assert_eq!(parse_amount_cents("$1234.56").unwrap(), 123456);
+        assert_eq!(parse_amount_cents("€ 42.90").unwrap(), 4290);
+    }
+
+    #[test]
+    fn rounds_half_up_on_the_third_decimal() {
+        assert_eq!(parse_amount_cents("12.345").unwrap(), 1235);
+        assert_eq!(parse_amount_cents("12.344").unwrap(), 1234);
+        assert_eq!(parse_amount_cents("-12.345").unwrap(), -1235);
+    }
+
+    #[test]
+    fn rejects_malformed_amounts() {
+        for bad in ["", "-", "abc", "1.2.3", ".", "--5"] {
+            assert!(parse_amount_cents(bad).is_err(), "expected {bad:?} to fail");
+        }
+    }
+
+    #[test]
+    fn parses_german_amounts() {
+        // Dot = thousands, comma = decimals.
+        assert_eq!(parse_de_amount_cents("-5.000,00").unwrap(), -500000);
+        assert_eq!(parse_de_amount_cents("5.082,40").unwrap(), 508240);
+        assert_eq!(parse_de_amount_cents("-1,49").unwrap(), -149);
+        assert_eq!(parse_de_amount_cents("518,00").unwrap(), 51800);
+        assert_eq!(parse_de_amount_cents("-2.000,00").unwrap(), -200000);
+        // A bare integer with a thousands dot and no decimals.
+        assert_eq!(parse_de_amount_cents("1.234").unwrap(), 123400);
+    }
+
+    // --- date parsing --------------------------------------------------------
+
+    #[test]
+    fn normalizes_common_date_layouts() {
+        assert_eq!(normalize_date("2026-01-05").unwrap(), "2026-01-05");
+        assert_eq!(normalize_date("05/01/2026").unwrap(), "2026-01-05"); // DD/MM/YYYY
+        assert_eq!(normalize_date("2026/01/05").unwrap(), "2026-01-05");
+        assert_eq!(normalize_date("22.06.2026").unwrap(), "2026-06-22"); // German
+        assert_eq!(normalize_date("1.1.2026").unwrap(), "2026-01-01"); // unpadded
+    }
+
+    #[test]
+    fn rejects_invalid_dates() {
+        assert!(normalize_date("not-a-date").is_err());
+        assert!(validate_date("2026-13-40").is_err());
+        assert!(validate_date("2026-02-15").is_ok());
+    }
+
+    // --- concept normalization ----------------------------------------------
+
+    #[test]
+    fn normalize_concept_collapses_whitespace() {
+        assert_eq!(normalize_concept("  BMW   Car  IT GmbH "), "BMW Car IT GmbH");
+        assert_eq!(normalize_concept(""), "");
+    }
+
+    // --- format detection ----------------------------------------------------
+
+    #[test]
+    fn detects_ing_and_canonical() {
+        let ing = "Umsatzanzeige;Datei erstellt am: 26.06.2026\n\n\
+                   Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;\
+                   Verwendungszweck;Saldo;Währung;Betrag;Währung\n";
+        assert_eq!(detect_format(ing), BankFormat::IngDiba);
+        assert_eq!(
+            detect_format("date,amount,description\n2026-01-01,-1.00,x\n"),
+            BankFormat::Canonical
+        );
+    }
+
+    // --- ING parsing ---------------------------------------------------------
+
+    const ING_SAMPLE: &str = "Umsatzanzeige;Datei erstellt am: 26.06.2026 14:43\n\
+\n\
+IBAN;DE80 5001 0517 5410 8018 30\n\
+Kontoname;Girokonto\n\
+Bank;ING\n\
+Saldo;26.021,35;EUR\n\
+\n\
+Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck;Saldo;Währung;Betrag;Währung\n\
+22.06.2026;20.06.2026;Ismael Jimenez Martinez;Echtzeitüberweisung;;26.021,35;EUR;-5.000,00;EUR\n\
+19.06.2026;19.06.2026;BMW Car IT GmbH;Gehalt/Rente;Verdienstabrechnung 06.26/1;31.021,35;EUR;5.082,40;EUR\n";
+
+    #[test]
+    fn parses_ing_export() {
+        let (rows, errors) = parse(ING_SAMPLE).unwrap();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(
+            rows[0],
+            ParsedRow {
+                date: "2026-06-22".into(),
+                amount_cents: -500000,
+                counterparty: "Ismael Jimenez Martinez".into(),
+                description: "Echtzeitüberweisung".into(),
+                category: None,
+            }
+        );
+        assert_eq!(rows[1].counterparty, "BMW Car IT GmbH");
+        assert_eq!(rows[1].amount_cents, 508240);
+        // Buchungstext + Verwendungszweck are joined.
+        assert_eq!(
+            rows[1].description,
+            "Gehalt/Rente Verdienstabrechnung 06.26/1"
+        );
+    }
+
+    #[test]
+    fn ing_without_header_is_a_fatal_error() {
+        // Trips detection via the banner but has no data header.
+        let err = parse("Umsatzanzeige;x\n\nnonsense\n").unwrap_err();
+        assert!(err.contains("header"), "unexpected error: {err}");
+    }
+
+    // --- canonical parsing ---------------------------------------------------
+
+    #[test]
+    fn parses_canonical_with_category() {
+        let csv = "date,amount,description,category\n\
+                   2026-01-05,-42.90,Grocery store,Groceries\n";
+        let (rows, errors) = parse(csv).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(
+            rows[0],
+            ParsedRow {
+                date: "2026-01-05".into(),
+                amount_cents: -4290,
+                counterparty: String::new(),
+                description: "Grocery store".into(),
+                category: Some("Groceries".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_requires_expected_columns() {
+        let err = parse("foo,bar\n1,2\n").unwrap_err();
+        assert!(err.contains("date"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn canonical_reports_bad_rows_but_keeps_going() {
+        let csv = "date,amount,description\n\
+                   not-a-date,-1.00,Bad date\n\
+                   2026-01-06,oops,Bad amount\n\
+                   2026-01-07,-9.99,Good row\n";
+        let (rows, errors) = parse(csv).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(errors.len(), 2);
+    }
+}

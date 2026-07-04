@@ -20,8 +20,9 @@ const accounts: Account[] = [
   },
 ];
 const categories: Category[] = [
-  { id: 7, name: "Groceries" },
-  { id: 8, name: "Rent" },
+  { id: 7, name: "Groceries", is_transfer: false },
+  { id: 8, name: "Rent", is_transfer: false },
+  { id: 9, name: "Transfer", is_transfer: true },
 ];
 
 function tx(p: Partial<Transaction> & { id: number }): Transaction {
@@ -31,9 +32,11 @@ function tx(p: Partial<Transaction> & { id: number }): Transaction {
     date: "2026-01-05",
     amount: -1000,
     description: "row",
+    counterparty: "",
     category_id: null,
     category_name: null,
-    is_internal_transfer: false,
+    is_verified: false,
+    is_auto_classified: false,
     created_at: "2026-01-05",
     ...p,
   };
@@ -80,7 +83,7 @@ describe("Transactions", () => {
   });
 
   it("changes a transaction's category inline", async () => {
-    vi.mocked(api.setTransactionCategory).mockResolvedValue(undefined);
+    vi.mocked(api.setTransactionCategory).mockResolvedValue(0);
     renderTransactions();
     await screen.findByText("Coffee shop");
 
@@ -93,17 +96,73 @@ describe("Transactions", () => {
     expect(refreshAll).toHaveBeenCalled();
   });
 
-  it("toggles a transaction's internal-transfer flag", async () => {
-    vi.mocked(api.setInternalTransfer).mockResolvedValue(undefined);
+  it("reports how many matching transactions a learned rule swept in", async () => {
+    vi.mocked(api.setTransactionCategory).mockResolvedValue(3);
+    renderTransactions();
+    await screen.findByText("Coffee shop");
+
+    await userEvent.selectOptions(
+      within(rowWith("Coffee shop")).getByRole("combobox"),
+      "8",
+    );
+    await waitFor(() =>
+      expect(mockStore.toast).toHaveBeenCalledWith(
+        expect.stringContaining("3"),
+      ),
+    );
+  });
+
+  it("hides the unverified warning and locks the category select when verified", async () => {
+    vi.mocked(api.listTransactions).mockResolvedValue([
+      tx({
+        id: 200,
+        description: "Salary",
+        is_verified: true,
+        category_id: 7,
+        category_name: "Groceries",
+      }),
+    ]);
+    renderTransactions();
+    await screen.findByText("Salary");
+
+    const row = rowWith("Salary");
+    expect(within(row).queryByText(/unverified/i)).not.toBeInTheDocument();
+    expect(within(row).getByRole("combobox")).toBeDisabled();
+  });
+
+  it("marks a transaction as verified", async () => {
+    vi.mocked(api.setTransactionVerified).mockResolvedValue(undefined);
     renderTransactions();
     await screen.findByText("Coffee shop");
 
     await userEvent.click(
-      within(rowWith("Coffee shop")).getByTitle(/internal transfer/i),
+      within(rowWith("Coffee shop")).getByTitle(/mark as verified/i),
     );
     await waitFor(() =>
-      expect(api.setInternalTransfer).toHaveBeenCalledWith(100, true),
+      expect(api.setTransactionVerified).toHaveBeenCalledWith(100, true),
     );
+  });
+
+  it("badges rows in the transfer category, identified by its id not its name", async () => {
+    vi.mocked(api.listTransactions).mockResolvedValue([
+      tx({ id: 100, description: "Coffee shop", amount: -450 }),
+      tx({
+        id: 102,
+        description: "To savings",
+        amount: -80000,
+        category_id: 9, // the is_transfer category, even though renamed below
+        category_name: "Umbuchung",
+      }),
+    ]);
+    renderTransactions();
+    await screen.findByText("To savings");
+
+    expect(
+      within(rowWith("To savings")).getByText(/⇄ transfer/i),
+    ).toBeInTheDocument();
+    expect(
+      within(rowWith("Coffee shop")).queryByText(/⇄ transfer/i),
+    ).not.toBeInTheDocument();
   });
 
   it("filters by account through the toolbar dropdown", async () => {

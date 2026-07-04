@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod importers;
 mod models;
 
 use rusqlite::Connection;
@@ -42,8 +43,10 @@ pub fn run() {
             commands::create_transaction,
             commands::update_transaction,
             commands::set_transaction_category,
-            commands::set_internal_transfer,
+            commands::set_transaction_verified,
             commands::delete_transaction,
+            commands::list_rules,
+            commands::delete_rule,
             commands::get_summary,
             commands::import_csv,
         ])

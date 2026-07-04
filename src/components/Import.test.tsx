@@ -54,6 +54,25 @@ describe("Import", () => {
     expect(screen.getByText("2")).toBeInTheDocument(); // imported count
   });
 
+  it("decodes an ISO-8859-1 bank export without mangling umlauts", async () => {
+    const { container } = render(
+      <Import accountId={1} onNavigate={onNavigate} />,
+    );
+    // "AüB" in ISO-8859-1 / windows-1252 (ü = 0xFC) — invalid UTF-8, so the
+    // decoder must fall back rather than emit replacement characters.
+    const file = new File([new Uint8Array([0x41, 0xfc, 0x42])], "ing.csv", {
+      type: "text/csv",
+    });
+    const input = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    await userEvent.upload(input, file);
+
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    await waitFor(() => expect(textarea.value).toBe("AüB"));
+    expect(textarea.value).not.toContain("�");
+  });
+
   it("does not call the backend when there is nothing to import", async () => {
     renderImport();
     // The button is disabled with an empty textarea, so the backend is untouched.

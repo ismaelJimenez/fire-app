@@ -88,4 +88,11 @@ describe("accountSelectOptions", () => {
     // Indentation uses non-breaking spaces so it survives <option> rendering.
     expect(vacation.label).toBe("  ".repeat(2) + "↳ Vacation");
   });
+  it("spells out the full ancestry in `path` so same-named subaccounts stay distinct", () => {
+    const opts = accountSelectOptions(accounts);
+    expect(opts.find((o) => o.id === 3)!.path).toBe(
+      "Checking › Savings › Vacation",
+    );
+    expect(opts.find((o) => o.id === 4)!.path).toBe("Cash");
+  });
 });

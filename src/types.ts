@@ -15,6 +15,10 @@ export interface Account {
 export interface Category {
   id: number;
   name: string;
+  /** Built-in role: transactions here are transfers between the user's own
+   *  accounts, excluded from income/expense totals. At most one category has it,
+   *  and it can't be deleted. */
+  is_transfer: boolean;
 }
 
 export interface Transaction {
@@ -25,10 +29,22 @@ export interface Transaction {
   /** Amount in cents; negative = expense. */
   amount: number;
   description: string;
+  /** Payee/counterparty ("concept") that drives auto-classification; may be "". */
+  counterparty: string;
   category_id: number | null;
   category_name: string | null;
-  is_internal_transfer: boolean;
+  /** Reviewed by the user; locked from rule-based re-categorization. */
+  is_verified: boolean;
+  /** Category was applied by a learned rule rather than set by hand. */
+  is_auto_classified: boolean;
   created_at: string;
+}
+
+export interface ClassificationRule {
+  id: number;
+  concept: string;
+  category_id: number;
+  category_name: string;
 }
 
 export interface ImportResult {

@@ -38,9 +38,6 @@ export function TransactionForm({
   const [categoryId, setCategoryId] = useState<number | null>(
     tx?.category_id ?? null,
   );
-  const [isTransfer, setIsTransfer] = useState(
-    tx?.is_internal_transfer ?? false,
-  );
   const [saving, setSaving] = useState(false);
 
   async function save() {
@@ -61,7 +58,6 @@ export function TransactionForm({
       amount: cents,
       description: description.trim(),
       category_id: categoryId,
-      is_internal_transfer: isTransfer,
     };
 
     setSaving(true);
@@ -178,18 +174,10 @@ export function TransactionForm({
         </select>
       </div>
 
-      <label className="checkbox" style={{ marginTop: 4 }}>
-        <input
-          type="checkbox"
-          checked={isTransfer}
-          onChange={(e) => setIsTransfer(e.target.checked)}
-        />
-        Internal transfer (excluded from income &amp; expense totals)
-      </label>
-      <div style={{ height: 4 }} />
-      {/* keep helper text alignment consistent */}
-      <p className="muted" style={{ fontSize: 12.5, marginTop: 0 }}>
-        Use for moving money between your own accounts.
+      <p className="muted" style={{ fontSize: 12.5, marginTop: 8 }}>
+        Moving money between your own accounts? Pick the{" "}
+        <strong>Transfer</strong> category — those are left out of income &amp;
+        expense totals.
       </p>
     </Modal>
   );

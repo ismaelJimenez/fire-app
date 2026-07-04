@@ -37,9 +37,11 @@ const recent: Transaction[] = [
     date: "2026-01-05",
     amount: -4290,
     description: "Corner store",
+    counterparty: "",
     category_id: null,
     category_name: null,
-    is_internal_transfer: false,
+    is_verified: false,
+    is_auto_classified: false,
     created_at: "2026-01-05",
   },
 ];

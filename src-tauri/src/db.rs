@@ -27,7 +27,16 @@ pub fn open_in_memory() -> rusqlite::Result<Connection> {
 ///
 /// Only ever *append* to this list — never edit or reorder an existing step, or
 /// databases in the field will diverge from fresh ones.
-const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_v1_baseline];
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[
+    migrate_v1_baseline,
+    migrate_v2_classification,
+    migrate_v3_fees_category,
+    migrate_v4_salary_category,
+    migrate_v5_dividends_category,
+    migrate_v6_transfer_category,
+    migrate_v7_transfer_category_flag,
+    migrate_v8_subscriptions_category,
+];
 
 /// Apply any migrations the database hasn't seen yet.
 ///
@@ -150,13 +159,208 @@ fn migrate_v1_baseline(conn: &Connection) -> rusqlite::Result<()> {
             "Shopping",
             "Health",
             "Entertainment",
+            "Fees",
+            "Salary",
+            "Dividends",
+            "Subscriptions",
             "Income",
             "Savings",
+            "Transfer",
         ] {
             conn.execute("INSERT INTO categories (name) VALUES (?1)", [name])?;
         }
     }
 
+    Ok(())
+}
+
+/// v2: concept-based auto-classification and manual verification.
+///
+/// - `transactions` gains a `counterparty` (the "concept" that drives
+///   classification), a `is_verified` review flag, and `is_auto_classified` so the
+///   UI can tell learned categories from ones the user set by hand.
+/// - `classification_rules` remembers, per concept, which category to apply. The
+///   concept is unique (case-insensitively) and a rule disappears when its category
+///   is deleted.
+///
+/// Idempotent like the baseline: the column adds are guarded so re-running over an
+/// already-migrated database is a no-op.
+fn migrate_v2_classification(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column = |name: &str| -> rusqlite::Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('transactions') WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
+
+    if !has_column("counterparty")? {
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN counterparty TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !has_column("is_verified")? {
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column("is_auto_classified")? {
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN is_auto_classified INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS classification_rules (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            -- The counterparty/concept this rule matches, unique case-insensitively.
+            concept     TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+            category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tx_counterparty ON transactions(counterparty);
+        "#,
+    )?;
+
+    Ok(())
+}
+
+/// v3: add the "Fees" default category to databases seeded before it existed.
+///
+/// `INSERT OR IGNORE` leans on the case-insensitive UNIQUE on `categories.name`,
+/// so it's a no-op when the user (or the first-run seed) already has a "Fees"
+/// category. Because migrations run once per database, a user who later deletes
+/// "Fees" won't see it reappear.
+fn migrate_v3_fees_category(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (name) VALUES ('Fees')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v4: add the "Salary" default category to databases seeded before it existed.
+///
+/// Same idempotent `INSERT OR IGNORE` approach as [`migrate_v3_fees_category`]:
+/// a no-op when a "Salary" category already exists, and it won't reappear if the
+/// user deletes it later.
+fn migrate_v4_salary_category(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (name) VALUES ('Salary')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v5: add the "Dividends" default category to databases seeded before it existed.
+///
+/// Same idempotent `INSERT OR IGNORE` approach as [`migrate_v3_fees_category`]:
+/// a no-op when a "Dividends" category already exists, and it won't reappear if
+/// the user deletes it later.
+fn migrate_v5_dividends_category(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (name) VALUES ('Dividends')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v8: add the "Subscriptions" default category (streaming, SaaS, AI tools such
+/// as Netflix, ChatGPT, Claude…) to databases seeded before it existed.
+///
+/// Same idempotent `INSERT OR IGNORE` approach as [`migrate_v3_fees_category`]:
+/// a no-op when a "Subscriptions" category already exists, and it won't reappear
+/// if the user deletes it later.
+fn migrate_v8_subscriptions_category(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (name) VALUES ('Subscriptions')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v6: replace the standalone `is_internal_transfer` flag with a first-class
+/// "Transfer" category. Money moved between the user's own accounts is now
+/// modelled as a transaction categorized "Transfer", which the dashboard summary
+/// leaves out of income/expense totals.
+///
+/// Seeds the category and moves any legacy transactions that were flagged as
+/// internal transfers (but never categorized) into it, so nothing that used to be
+/// excluded from totals silently starts counting. The `is_internal_transfer`
+/// column is left in place — harmless and avoids a table rebuild — but is no
+/// longer read. Idempotent: re-running only ever re-touches already-migrated rows.
+fn migrate_v6_transfer_category(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (name) VALUES ('Transfer')",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE transactions
+            SET category_id = (SELECT id FROM categories WHERE name = 'Transfer')
+          WHERE is_internal_transfer = 1 AND category_id IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v7: make "the transfer category" a durable property instead of a magic name.
+///
+/// Adds a `categories.is_transfer` role flag and points it at the built-in
+/// Transfer category. Summaries and the UI identify transfers by this flag, so the
+/// category can be renamed freely without breaking totals. A partial unique index
+/// keeps it a singleton, and `delete_category` refuses to remove the flagged row,
+/// so the totals can never be silently changed by deleting it.
+///
+/// Idempotent: the column add is guarded, the category insert is `OR IGNORE`, and
+/// the index/flag updates converge to the same state on every run.
+fn migrate_v7_transfer_category_flag(conn: &Connection) -> rusqlite::Result<()> {
+    let has_flag: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('categories') WHERE name = 'is_transfer'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_flag == 0 {
+        conn.execute(
+            "ALTER TABLE categories ADD COLUMN is_transfer INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Guarantee the built-in category exists even if a user deleted it under an
+    // earlier version, then flag exactly that row.
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (name) VALUES ('Transfer')",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE categories SET is_transfer = 1 WHERE name = 'Transfer'",
+        [],
+    )?;
+
+    // At most one category may carry the flag.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_categories_transfer
+             ON categories(is_transfer) WHERE is_transfer = 1",
+        [],
+    )?;
+
+    // Backstop the app-level guard: even a stray DELETE can't remove the transfer
+    // category and silently change the dashboard totals.
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_protect_transfer_category
+             BEFORE DELETE ON categories
+             WHEN OLD.is_transfer = 1
+             BEGIN
+                 SELECT RAISE(ABORT, 'The Transfer category is built in and cannot be deleted.');
+             END",
+        [],
+    )?;
     Ok(())
 }
 
@@ -190,7 +394,62 @@ mod tests {
         let cats: i64 = conn
             .query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cats, 10);
+        assert_eq!(cats, 15);
+        // The newer defaults are all present on a fresh database.
+        let named: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories \
+                 WHERE name IN ('Fees', 'Salary', 'Dividends', 'Transfer')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(named, 4);
+        // The transfer role is carried by exactly the built-in "Transfer" row.
+        let flagged: (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(name), '') FROM categories WHERE is_transfer = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(flagged, (1, "Transfer".to_string()));
+    }
+
+    #[test]
+    fn transfer_role_is_a_singleton_and_survives_a_rename() {
+        let conn = open_in_memory().unwrap();
+
+        // Renaming the category keeps the role, so transfers stay identifiable.
+        conn.execute(
+            "UPDATE categories SET name = 'Umbuchung' WHERE is_transfer = 1",
+            [],
+        )
+        .unwrap();
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM categories WHERE is_transfer = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Umbuchung");
+
+        // A second transfer category is rejected by the partial unique index.
+        let dup = conn.execute(
+            "INSERT INTO categories (name, is_transfer) VALUES ('Another', 1)",
+            [],
+        );
+        assert!(dup.is_err(), "only one category may be the transfer role");
+
+        // Deleting the transfer category is blocked at the data layer.
+        let del = conn.execute("DELETE FROM categories WHERE is_transfer = 1", []);
+        assert!(del.is_err(), "the transfer category must not be deletable");
+        // A plain category is still deletable.
+        conn.execute("INSERT INTO categories (name) VALUES ('Scratch')", [])
+            .unwrap();
+        conn.execute("DELETE FROM categories WHERE name = 'Scratch'", [])
+            .unwrap();
     }
 
     #[test]
@@ -258,6 +517,77 @@ mod tests {
         let cats: i64 = conn
             .query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cats, 10);
+        assert_eq!(cats, 15);
+    }
+
+    #[test]
+    fn v6_moves_legacy_flagged_transfers_into_the_transfer_category() {
+        // A database migrated only through v5, with a transaction flagged as an
+        // internal transfer the old way and left uncategorized.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate_v1_baseline(&conn).unwrap();
+        migrate_v2_classification(&conn).unwrap();
+        conn.execute("INSERT INTO accounts (name) VALUES ('Checking')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (account_id, date, amount, is_internal_transfer)
+             VALUES (1, '2026-01-01', -50000, 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The flagged row now carries the Transfer category.
+        let cat: Option<String> = conn
+            .query_row(
+                "SELECT c.name FROM transactions t
+                 LEFT JOIN categories c ON c.id = t.category_id
+                 WHERE t.id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cat.as_deref(), Some("Transfer"));
+    }
+
+    #[test]
+    fn v3_backfills_fees_for_legacy_databases_without_duplicating() {
+        // A database migrated up to v2 (before "Fees" was a default): pretend the
+        // user already had their own categories and none of them is "Fees".
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate_v1_baseline(&conn).unwrap();
+        conn.execute("DELETE FROM categories", []).unwrap();
+        conn.execute(
+            "INSERT INTO categories (name) VALUES ('Groceries'), ('Rent')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let fees: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Fees'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fees, 1, "v3 should add exactly one Fees category");
+
+        // Running again must not create a second "Fees".
+        migrate_v3_fees_category(&conn).unwrap();
+        let fees_again: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Fees'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fees_again, 1, "backfill must be idempotent");
     }
 }

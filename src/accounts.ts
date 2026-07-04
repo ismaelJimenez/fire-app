@@ -79,16 +79,34 @@ export interface AccountOption {
   id: number;
   /** Display label; subaccounts are indented per depth to read as nested. */
   label: string;
+  /**
+   * Fully qualified label showing the whole ancestry, e.g. "Checking > Savings".
+   * Unlike `label`, this stays unambiguous when subaccounts share a name.
+   */
+  path: string;
   depth: number;
 }
 
 /**
  * Flatten the tree into `<select>` options, each account immediately followed by
  * its subaccounts, indented by depth so the dropdown mirrors the sidebar order.
+ * Each option also carries a `path` naming its full ancestry for menus where
+ * indentation alone can't tell same-named subaccounts apart.
  */
 export function accountSelectOptions(accounts: Account[]): AccountOption[] {
+  const byId = new Map(accounts.map((a) => [a.id, a] as const));
+  const pathOf = (account: Account): string => {
+    const names: string[] = [];
+    let cur: Account | undefined = account;
+    while (cur) {
+      names.unshift(cur.name);
+      cur = cur.parent_id != null ? byId.get(cur.parent_id) : undefined;
+    }
+    return names.join(" › ");
+  };
   return flattenTree(buildAccountTree(accounts)).map((n) => ({
     id: n.account.id,
+    path: pathOf(n.account),
     label: "  ".repeat(n.depth) + (n.depth > 0 ? "↳ " : "") + n.account.name,
     depth: n.depth,
   }));

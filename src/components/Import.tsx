@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { useStore } from "../store";
 import * as api from "../api";
+import { accountSelectOptions } from "../accounts";
 import type { ImportResult, View } from "../types";
 
 const TEMPLATE = `date,amount,description,category
@@ -12,6 +13,17 @@ const TEMPLATE = `date,amount,description,category
 interface Props {
   accountId: number | null;
   onNavigate: (view: View, accountId?: number | null) => void;
+}
+
+/** Decode an uploaded file, tolerating the ISO-8859-1 / windows-1252 encoding many
+ *  German bank exports (e.g. ING-DiBa) use — reading those as UTF-8 mangles umlauts. */
+async function decodeFile(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buf);
+  } catch {
+    return new TextDecoder("windows-1252").decode(buf);
+  }
 }
 
 export function Import({ accountId, onNavigate }: Props) {
@@ -27,7 +39,7 @@ export function Import({ accountId, onNavigate }: Props) {
   const fileInput = useRef<HTMLInputElement>(null);
 
   async function loadFile(file: File) {
-    const text = await file.text();
+    const text = await decodeFile(file);
     setCsv(text);
     setFileName(file.name);
     setResult(null);
@@ -106,9 +118,9 @@ export function Import({ accountId, onNavigate }: Props) {
                 value={target ?? ""}
                 onChange={(e) => setTarget(Number(e.target.value))}
               >
-                {accounts.map((a) => (
+                {accountSelectOptions(accounts).map((a) => (
                   <option key={a.id} value={a.id}>
-                    {a.name}
+                    {a.path}
                   </option>
                 ))}
               </select>
@@ -260,6 +272,12 @@ export function Import({ accountId, onNavigate }: Props) {
             <p className="muted" style={{ fontSize: 12.5 }}>
               Columns are matched by header name, so their order doesn’t matter.
               Rows identical to ones already imported are skipped automatically.
+            </p>
+            <p className="muted" style={{ fontSize: 12.5 }}>
+              Bank exports are detected automatically — you can drop an{" "}
+              <strong>ING-DiBa</strong> Girokonto CSV here as-is, no reformatting
+              needed. Payees you’ve categorized before are classified for you on
+              import.
             </p>
             <button className="btn" onClick={downloadTemplate}>
               ↓ Download template
