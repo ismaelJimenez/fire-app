@@ -3,9 +3,12 @@ export type View = "dashboard" | "transactions" | "import";
 export interface Account {
   id: number;
   name: string;
+  /** Parent account this is a subaccount of, or null for a top-level account. */
+  parent_id: number | null;
   created_at: string;
-  /** Balance in cents. */
+  /** This account's own balance in cents (excludes subaccounts). */
   balance: number;
+  /** This account's own transaction count (excludes subaccounts). */
   tx_count: number;
 }
 

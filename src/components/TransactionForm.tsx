@@ -3,6 +3,7 @@ import { useStore } from "../store";
 import * as api from "../api";
 import { Modal } from "./Modal";
 import { parseAmountToCents, todayIso } from "../format";
+import { accountSelectOptions } from "../accounts";
 import type { Transaction } from "../types";
 
 interface Props {
@@ -12,6 +13,8 @@ interface Props {
   defaultAccountId: number | null;
   onClose: () => void;
   onSaved: () => void;
+  /** When editing, request deletion of this transaction. */
+  onDelete?: () => void;
 }
 
 export function TransactionForm({
@@ -19,6 +22,7 @@ export function TransactionForm({
   defaultAccountId,
   onClose,
   onSaved,
+  onDelete,
 }: Props) {
   const { accounts, categories, toast } = useStore();
 
@@ -84,6 +88,15 @@ export function TransactionForm({
       onClose={onClose}
       footer={
         <>
+          {tx && onDelete && (
+            <button
+              className="btn danger"
+              style={{ marginRight: "auto" }}
+              onClick={onDelete}
+            >
+              🗑 Delete
+            </button>
+          )}
           <button className="btn" onClick={onClose}>
             Cancel
           </button>
@@ -100,9 +113,9 @@ export function TransactionForm({
           onChange={(e) => setAccountId(Number(e.target.value))}
         >
           {accounts.length === 0 && <option value="">No accounts</option>}
-          {accounts.map((a) => (
+          {accountSelectOptions(accounts).map((a) => (
             <option key={a.id} value={a.id}>
-              {a.name}
+              {a.label}
             </option>
           ))}
         </select>

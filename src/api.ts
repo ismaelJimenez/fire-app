@@ -15,6 +15,8 @@ export const renameAccount = (id: number, name: string) =>
   invoke<void>("rename_account", { id, name });
 export const deleteAccount = (id: number) =>
   invoke<void>("delete_account", { id });
+export const addSubaccount = (parentId: number, name: string) =>
+  invoke<number>("add_subaccount", { parentId, name });
 
 // Categories
 export const listCategories = () => invoke<Category[]>("list_categories");

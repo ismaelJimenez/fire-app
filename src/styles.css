@@ -184,11 +184,25 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 500;
+  /* Buttons don't inherit the body font-size, so set it explicitly to keep
+     parent and subaccount names consistent. */
+  font-size: 14px;
 }
 .account-row .acc-balance {
   font-variant-numeric: tabular-nums;
   font-size: 12.5px;
   color: var(--text-muted);
+}
+
+/* Subaccounts are indented inline by depth (see Sidebar). */
+.account-row.subaccount .acc-name {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.account-row.subaccount .subaccount-tick {
+  margin-right: 6px;
+  color: var(--text-faint);
 }
 
 .empty-hint {

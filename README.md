@@ -8,6 +8,8 @@ categorize, and mark internal transfers.
 
 - **Accounts** — create, rename, and delete accounts from the sidebar (deleting an
   account removes its transactions).
+- **Subaccounts** — add subaccounts under any account; their balances roll up into
+  the parent, and deleting a parent removes its subaccounts too.
 - **CSV import** — drop or paste a CSV; columns are matched by header name and duplicate
   rows are skipped automatically so re-imports are safe.
 - **Manual entry** — add and edit transactions with a simple form.

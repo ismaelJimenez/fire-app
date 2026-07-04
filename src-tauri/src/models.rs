@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct Account {
     pub id: i64,
     pub name: String,
+    /// Parent account this was split from, or `None` for a top-level account.
+    pub parent_id: Option<i64>,
     pub created_at: String,
     /// Sum of all transaction amounts for the account, in cents.
     pub balance: i64,

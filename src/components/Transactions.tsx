@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useStore } from "../store";
 import * as api from "../api";
 import { formatDate, formatMoney } from "../format";
+import { accountSelectOptions } from "../accounts";
 import { TransactionForm } from "./TransactionForm";
 import { Modal } from "./Modal";
 import type { Transaction } from "../types";
@@ -120,9 +121,9 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
           }
         >
           <option value="">All accounts</option>
-          {accounts.map((a) => (
+          {accountSelectOptions(accounts).map((a) => (
             <option key={a.id} value={a.id}>
-              {a.name}
+              {a.label}
             </option>
           ))}
         </select>
@@ -222,13 +223,6 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                       >
                         ✎
                       </button>
-                      <button
-                        className="icon-btn danger"
-                        title="Delete"
-                        onClick={() => setDeleting(tx)}
-                      >
-                        🗑
-                      </button>
                     </div>
                   </td>
                 </tr>
@@ -244,6 +238,14 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
           defaultAccountId={accountId}
           onClose={() => setEditing(null)}
           onSaved={afterMutation}
+          onDelete={
+            editing !== "new"
+              ? () => {
+                  setDeleting(editing);
+                  setEditing(null);
+                }
+              : undefined
+          }
         />
       )}
 

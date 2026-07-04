@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useStore } from "../store";
 import * as api from "../api";
 import { formatDate, formatMoney } from "../format";
+import { buildAccountTree, flattenTree, type AccountNode } from "../accounts";
 import type { Transaction, View } from "../types";
 
 interface Props {
@@ -94,29 +95,9 @@ export function Dashboard({ onNavigate }: Props) {
           <div className="card">
             <table>
               <tbody>
-                {accounts.map((a) => (
-                  <tr
-                    key={a.id}
-                    style={{ cursor: "pointer" }}
-                    onClick={() => onNavigate("transactions", a.id)}
-                  >
-                    <td style={{ fontWeight: 500 }}>{a.name}</td>
-                    <td className="muted" style={{ textAlign: "right" }}>
-                      {a.tx_count} txn
-                    </td>
-                    <td
-                      className="amount"
-                      style={{
-                        color:
-                          a.balance < 0
-                            ? "var(--negative)"
-                            : "var(--positive)",
-                      }}
-                    >
-                      {formatMoney(a.balance)}
-                    </td>
-                  </tr>
-                ))}
+                {flattenTree(buildAccountTree(accounts)).map((node) =>
+                  accountRow(node, onNavigate),
+                )}
               </tbody>
             </table>
           </div>
@@ -162,5 +143,40 @@ export function Dashboard({ onNavigate }: Props) {
         </div>
       </div>
     </div>
+  );
+}
+
+function accountRow(
+  node: AccountNode,
+  onNavigate: (view: View, accountId?: number | null) => void,
+) {
+  const a = node.account;
+  const isChild = node.depth > 0;
+  return (
+    <tr
+      key={a.id}
+      style={{ cursor: "pointer" }}
+      onClick={() => onNavigate("transactions", a.id)}
+    >
+      <td style={{ fontWeight: isChild ? 400 : 500 }}>
+        <span
+          className={isChild ? "muted" : undefined}
+          style={{ paddingLeft: node.depth * 16 }}
+        >
+          {isChild ? `↳ ${a.name}` : a.name}
+        </span>
+      </td>
+      <td className="muted" style={{ textAlign: "right" }}>
+        {node.rollupTxCount} txn
+      </td>
+      <td
+        className="amount"
+        style={{
+          color: node.rollupBalance < 0 ? "var(--negative)" : "var(--positive)",
+        }}
+      >
+        {formatMoney(node.rollupBalance)}
+      </td>
+    </tr>
   );
 }

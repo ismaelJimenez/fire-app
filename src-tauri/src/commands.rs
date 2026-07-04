@@ -19,9 +19,11 @@ fn e<E: std::fmt::Display>(err: E) -> String {
 #[tauri::command]
 pub fn list_accounts(state: State<AppState>) -> CmdResult<Vec<Account>> {
     let conn = state.db.lock().map_err(e)?;
+    // `balance` and `tx_count` are each account's own transactions only; the
+    // front end rolls a parent's subaccounts up for display.
     let mut stmt = conn
         .prepare(
-            "SELECT a.id, a.name, a.created_at,
+            "SELECT a.id, a.name, a.parent_id, a.created_at,
                     COALESCE(SUM(t.amount), 0) AS balance,
                     COUNT(t.id) AS tx_count
              FROM accounts a
@@ -35,13 +37,53 @@ pub fn list_accounts(state: State<AppState>) -> CmdResult<Vec<Account>> {
             Ok(Account {
                 id: r.get(0)?,
                 name: r.get(1)?,
-                created_at: r.get(2)?,
-                balance: r.get(3)?,
-                tx_count: r.get(4)?,
+                parent_id: r.get(2)?,
+                created_at: r.get(3)?,
+                balance: r.get(4)?,
+                tx_count: r.get(5)?,
             })
         })
         .map_err(e)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(e)
+}
+
+/// Add a subaccount under any account (nesting is unlimited).
+///
+/// The subaccount starts empty; transactions can then be created or moved into
+/// it. Balances roll up through every ancestor.
+#[tauri::command]
+pub fn add_subaccount(state: State<AppState>, parent_id: i64, name: String) -> CmdResult<i64> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Subaccount name cannot be empty".into());
+    }
+    let conn = state.db.lock().map_err(e)?;
+
+    // The parent must exist; new accounts are always leaves, so no cycle is possible.
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM accounts WHERE id = ?1",
+            params![parent_id],
+            |r| r.get(0),
+        )
+        .map_err(e)?;
+    if exists == 0 {
+        return Err("Account not found".into());
+    }
+
+    conn.execute(
+        "INSERT INTO accounts (name, parent_id) VALUES (?1, ?2)",
+        params![name, parent_id],
+    )
+    .map_err(|err| match err {
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            format!("This account already has a subaccount named \"{name}\"")
+        }
+        other => e(other),
+    })?;
+    Ok(conn.last_insert_rowid())
 }
 
 #[tauri::command]
@@ -53,7 +95,9 @@ pub fn create_account(state: State<AppState>, name: String) -> CmdResult<i64> {
     let conn = state.db.lock().map_err(e)?;
     conn.execute("INSERT INTO accounts (name) VALUES (?1)", params![name])
         .map_err(|err| match err {
-            rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
+            rusqlite::Error::SqliteFailure(f, _)
+                if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
                 format!("An account named \"{name}\" already exists")
             }
             other => e(other),
@@ -73,7 +117,9 @@ pub fn rename_account(state: State<AppState>, id: i64, name: String) -> CmdResul
         params![name, id],
     )
     .map_err(|err| match err {
-        rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
             format!("An account named \"{name}\" already exists")
         }
         other => e(other),
@@ -312,12 +358,20 @@ pub fn delete_transaction(state: State<AppState>, id: i64) -> CmdResult<()> {
 #[tauri::command]
 pub fn get_summary(state: State<AppState>) -> CmdResult<Summary> {
     let conn = state.db.lock().map_err(e)?;
+    compute_summary(&conn)
+}
+
+/// Core of `get_summary`, decoupled from Tauri state so it can be tested
+/// directly against a `Connection`.
+fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
     // Internal transfers are excluded from income/expense totals but still
     // count toward account balances.
     let total_balance: i64 = conn
-        .query_row("SELECT COALESCE(SUM(amount), 0) FROM transactions", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions",
+            [],
+            |r| r.get(0),
+        )
         .map_err(e)?;
     let income: i64 = conn
         .query_row(
@@ -372,7 +426,16 @@ pub fn import_csv(
     csv_text: String,
 ) -> CmdResult<ImportResult> {
     let mut conn = state.db.lock().map_err(e)?;
+    import_csv_into(&mut conn, account_id, &csv_text)
+}
 
+/// Core of `import_csv`, decoupled from Tauri state so it can be tested directly
+/// against a `Connection`.
+fn import_csv_into(
+    conn: &mut Connection,
+    account_id: i64,
+    csv_text: &str,
+) -> CmdResult<ImportResult> {
     let mut reader = csv::ReaderBuilder::new()
         .trim(csv::Trim::All)
         .flexible(true)
@@ -478,17 +541,244 @@ fn normalize_date(raw: &str) -> CmdResult<String> {
 }
 
 /// Parse a decimal amount string into integer cents.
+///
+/// Currency symbols, spaces and thousands separators are stripped first, then
+/// the remaining decimal is converted to cents using integer arithmetic so no
+/// floating-point rounding error can creep in. Mirrors `parseAmountToCents` in
+/// the front end (`src/format.ts`); keep the two in sync.
 fn parse_amount_cents(raw: &str) -> CmdResult<i64> {
     // Strip currency symbols, spaces and thousands separators.
     let cleaned: String = raw
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '.')
         .collect();
-    if cleaned.is_empty() || cleaned == "-" {
-        return Err(format!("Invalid amount \"{raw}\""));
+    decimal_str_to_cents(&cleaned).ok_or_else(|| format!("Invalid amount \"{raw}\""))
+}
+
+/// Convert a cleaned decimal string (digits, an optional leading `-`, and at
+/// most one `.`) into integer cents, rounding half-up on the third decimal.
+/// Returns `None` for anything that is not a well-formed number.
+fn decimal_str_to_cents(s: &str) -> Option<i64> {
+    let negative = s.starts_with('-');
+    let body = s.strip_prefix('-').unwrap_or(s);
+    if body.is_empty() {
+        return None;
     }
-    let value: f64 = cleaned
-        .parse()
-        .map_err(|_| format!("Invalid amount \"{raw}\""))?;
-    Ok((value * 100.0).round() as i64)
+
+    let mut parts = body.splitn(2, '.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next().unwrap_or("");
+
+    // A second '.' (e.g. "1.2.3") lands inside frac_part; reject it.
+    if frac_part.contains('.') {
+        return None;
+    }
+    // Need at least one digit somewhere, and every char must be a digit.
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let int_val: i64 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+
+    let digit = |i: usize| frac_part.as_bytes().get(i).map_or(0, |b| (b - b'0') as i64);
+    let mut cents = int_val.checked_mul(100)? + digit(0) * 10 + digit(1);
+    // Round half-up based on the third fractional digit, if present.
+    if digit(2) >= 5 {
+        cents += 1;
+    }
+
+    Some(if negative { -cents } else { cents })
+}
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    // --- parse_amount_cents / decimal_str_to_cents ---------------------------
+
+    #[test]
+    fn parses_plain_decimals_without_float_error() {
+        assert_eq!(parse_amount_cents("12.34").unwrap(), 1234);
+        assert_eq!(parse_amount_cents("-12.34").unwrap(), -1234);
+        assert_eq!(parse_amount_cents("1500.00").unwrap(), 150000);
+        assert_eq!(parse_amount_cents("0.01").unwrap(), 1);
+        assert_eq!(parse_amount_cents("0").unwrap(), 0);
+        // 0.29 is the classic binary-float trap; integer parsing nails it.
+        assert_eq!(parse_amount_cents("0.29").unwrap(), 29);
+    }
+
+    #[test]
+    fn parses_partial_and_shorthand_decimals() {
+        assert_eq!(parse_amount_cents("5").unwrap(), 500);
+        assert_eq!(parse_amount_cents("5.5").unwrap(), 550);
+        assert_eq!(parse_amount_cents(".5").unwrap(), 50);
+        assert_eq!(parse_amount_cents("-.5").unwrap(), -50);
+    }
+
+    #[test]
+    fn strips_currency_symbols_and_thousands_separators() {
+        assert_eq!(parse_amount_cents("$1234.56").unwrap(), 123456);
+        assert_eq!(parse_amount_cents("€ 42.90").unwrap(), 4290);
+    }
+
+    #[test]
+    fn rounds_half_up_on_the_third_decimal() {
+        assert_eq!(parse_amount_cents("12.345").unwrap(), 1235);
+        assert_eq!(parse_amount_cents("12.344").unwrap(), 1234);
+        assert_eq!(parse_amount_cents("-12.345").unwrap(), -1235);
+    }
+
+    #[test]
+    fn rejects_malformed_amounts() {
+        for bad in ["", "-", "abc", "1.2.3", ".", "--5"] {
+            assert!(parse_amount_cents(bad).is_err(), "expected {bad:?} to fail");
+        }
+    }
+
+    // --- normalize_date / validate_date --------------------------------------
+
+    #[test]
+    fn normalizes_common_date_layouts() {
+        assert_eq!(normalize_date("2026-01-05").unwrap(), "2026-01-05");
+        assert_eq!(normalize_date("05/01/2026").unwrap(), "2026-01-05"); // DD/MM/YYYY
+        assert_eq!(normalize_date("2026/01/05").unwrap(), "2026-01-05");
+    }
+
+    #[test]
+    fn rejects_invalid_dates() {
+        assert!(normalize_date("not-a-date").is_err());
+        assert!(validate_date("2026-13-40").is_err());
+        assert!(validate_date("2026-02-15").is_ok());
+    }
+
+    // --- import_csv_into (integration against a real SQLite schema) -----------
+
+    /// Insert a top-level account and return its id.
+    fn seed_account(conn: &Connection, name: &str) -> i64 {
+        conn.execute("INSERT INTO accounts (name) VALUES (?1)", params![name])
+            .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn import_inserts_rows_and_creates_categories() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let csv = "date,amount,description,category\n\
+                   2026-01-05,-42.90,Grocery store,Groceries\n\
+                   2026-01-06,1500.00,Salary,Income\n";
+
+        let result = import_csv_into(&mut conn, acc, csv).unwrap();
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.skipped_duplicates, 0);
+        assert!(result.errors.is_empty());
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        // A brand-new "Groceries"/"Income" pair are among the seeded defaults, so
+        // no duplicates should have been created.
+        let cats: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name IN ('Groceries','Income')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cats, 2);
+    }
+
+    #[test]
+    fn import_is_idempotent_on_reimport() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let csv = "date,amount,description\n2026-01-05,-42.90,Grocery store\n";
+
+        let first = import_csv_into(&mut conn, acc, csv).unwrap();
+        assert_eq!(first.imported, 1);
+
+        let second = import_csv_into(&mut conn, acc, csv).unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped_duplicates, 1);
+    }
+
+    #[test]
+    fn import_reports_bad_rows_but_keeps_going() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let csv = "date,amount,description\n\
+                   not-a-date,-1.00,Bad date\n\
+                   2026-01-06,oops,Bad amount\n\
+                   2026-01-07,-9.99,Good row\n";
+
+        let result = import_csv_into(&mut conn, acc, csv).unwrap();
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.errors.len(), 2);
+    }
+
+    #[test]
+    fn import_requires_expected_columns() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let err = import_csv_into(&mut conn, acc, "foo,bar\n1,2\n").unwrap_err();
+        assert!(err.contains("date"), "unexpected error: {err}");
+    }
+
+    // --- compute_summary -----------------------------------------------------
+
+    #[test]
+    fn summary_excludes_internal_transfers_from_income_and_expense() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let insert = |amount: i64, transfer: i64| {
+            conn.execute(
+                "INSERT INTO transactions (account_id, date, amount, is_internal_transfer)
+                 VALUES (?1, '2026-01-01', ?2, ?3)",
+                params![acc, amount, transfer],
+            )
+            .unwrap();
+        };
+        insert(150000, 0); // income
+        insert(-42_90, 0); // expense
+        insert(-80000, 1); // internal transfer: balance only
+
+        let s = compute_summary(&conn).unwrap();
+        assert_eq!(s.income, 150000);
+        assert_eq!(s.expenses, -4290);
+        assert_eq!(s.total_balance, 150000 - 4290 - 80000);
+        assert_eq!(s.transaction_count, 3);
+        assert_eq!(s.account_count, 1);
+    }
+
+    #[test]
+    fn deleting_account_cascades_to_transactions() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        conn.execute(
+            "INSERT INTO transactions (account_id, date, amount) VALUES (?1, '2026-01-01', 100)",
+            params![acc],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM accounts WHERE id = ?1", params![acc])
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }
