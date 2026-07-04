@@ -13,6 +13,7 @@ concurrency:
 jobs:
   frontend:
     name: Frontend (typecheck + tests)
+    # jsdom and tsc are OS-independent, so one runner is enough here.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,8 +36,9 @@ jobs:
       - name: Test
         run: pnpm test
 
-  rust:
-    name: Rust (fmt + clippy + tests)
+  lint-rust:
+    name: Rust lint (fmt + clippy)
+    # Formatting and lints don't vary by OS; run them once.
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -44,8 +46,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Tauri's Rust crate links against system webkit/gtk libraries, so they
-      # must be present even though the tests only exercise app logic.
       - name: Install Tauri system dependencies
         run: |
           sudo apt-get update
@@ -73,6 +73,45 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  test-rust:
+    name: Rust tests (${{ matrix.os }})
+    # The logic tests compile SQLite (bundled) per-OS and link against
+    # platform webview libraries, so run them on all three shipping targets.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only Linux needs webkit/gtk installed; macOS and Windows ship the
+      # webview (WebKit / WebView2) and C toolchain the crate needs.
+      - name: Install Tauri system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libgtk-3-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.os }}
 
       - name: Test
         run: cargo test
