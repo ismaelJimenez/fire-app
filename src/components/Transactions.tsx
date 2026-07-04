@@ -89,9 +89,7 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
         <div>
           <h1>Transactions</h1>
           <p>
-            {activeAccount
-              ? `Showing ${activeAccount.name}`
-              : "All accounts"}
+            {activeAccount ? `Showing ${activeAccount.name}` : "All accounts"}
             {" · "}
             {rows.length} shown
           </p>
@@ -171,7 +169,10 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                   <td>
                     {tx.description || <span className="muted">—</span>}
                     {tx.is_internal_transfer && (
-                      <span className="badge transfer" style={{ marginLeft: 8 }}>
+                      <span
+                        className="badge transfer"
+                        style={{ marginLeft: 8 }}
+                      >
                         ⇄ transfer
                       </span>
                     )}
@@ -196,9 +197,7 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
                     className="amount"
                     style={{
                       color:
-                        tx.amount < 0
-                          ? "var(--negative)"
-                          : "var(--positive)",
+                        tx.amount < 0 ? "var(--negative)" : "var(--positive)",
                     }}
                   >
                     {formatMoney(tx.amount)}
@@ -270,8 +269,9 @@ export function Transactions({ accountId, onSelectAccount }: Props) {
         >
           <p>
             Delete this transaction
-            {deleting.description ? ` (“${deleting.description}”)` : ""} for{" "}
-            {formatMoney(deleting.amount)}? This cannot be undone.
+            {deleting.description
+              ? ` (“${deleting.description}”)`
+              : ""} for {formatMoney(deleting.amount)}? This cannot be undone.
           </p>
         </Modal>
       )}

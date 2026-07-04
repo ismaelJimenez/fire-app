@@ -4,6 +4,7 @@ import { Sidebar } from "./components/Sidebar";
 import { Dashboard } from "./components/Dashboard";
 import { Transactions } from "./components/Transactions";
 import { Import } from "./components/Import";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import type { View } from "./types";
 import "./styles.css";
 
@@ -60,8 +61,10 @@ function Shell() {
 
 export default function App() {
   return (
-    <StoreProvider>
-      <Shell />
-    </StoreProvider>
+    <ErrorBoundary>
+      <StoreProvider>
+        <Shell />
+      </StoreProvider>
+    </ErrorBoundary>
   );
 }

@@ -1,0 +1,6 @@
+dist
+node_modules
+coverage
+# Rust crate + Tauri-generated files (schemas, capabilities) — not ours to format.
+src-tauri
+pnpm-lock.yaml

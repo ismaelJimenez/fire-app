@@ -26,10 +26,7 @@ export const deleteCategory = (id: number) =>
   invoke<void>("delete_category", { id });
 
 // Transactions
-export const listTransactions = (
-  accountId: number | null,
-  search: string,
-) =>
+export const listTransactions = (accountId: number | null, search: string) =>
   invoke<Transaction[]>("list_transactions", {
     accountId,
     search: search || null,

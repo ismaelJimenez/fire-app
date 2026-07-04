@@ -12,8 +12,8 @@ concurrency:
 
 jobs:
   frontend:
-    name: Frontend (typecheck + tests)
-    # jsdom and tsc are OS-independent, so one runner is enough here.
+    name: Frontend (lint + typecheck + tests + build)
+    # jsdom, tsc, ESLint and Prettier are OS-independent, so one runner suffices.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,11 +30,28 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Lint
+        run: pnpm lint
+
+      - name: Check formatting
+        run: pnpm format:check
+
       - name: Typecheck
         run: pnpm exec tsc --noEmit
 
-      - name: Test
-        run: pnpm test
+      - name: Test (with coverage)
+        run: pnpm test:coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage
+          path: coverage
+          if-no-files-found: ignore
+
+      - name: Build
+        run: pnpm build
 
   lint-rust:
     name: Rust lint (fmt + clippy)
@@ -73,6 +90,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (verify the binary compiles with locked deps)
+        run: cargo build --locked
 
   test-rust:
     name: Rust tests (${{ matrix.os }})

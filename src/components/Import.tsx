@@ -96,7 +96,9 @@ export function Import({ accountId, onNavigate }: Props) {
           </p>
         </div>
       ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 20 }}>
+        <div
+          style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 20 }}
+        >
           <div className="card" style={{ padding: 20 }}>
             <div className="field">
               <label>Import into account</label>
@@ -192,7 +194,11 @@ export function Import({ accountId, onNavigate }: Props) {
             {result && (
               <div
                 className="card"
-                style={{ marginTop: 18, padding: 16, background: "var(--surface-2)" }}
+                style={{
+                  marginTop: 18,
+                  padding: 16,
+                  background: "var(--surface-2)",
+                }}
               >
                 <div style={{ fontWeight: 600, marginBottom: 8 }}>
                   Import summary

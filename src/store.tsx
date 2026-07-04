@@ -112,6 +112,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 }
 
+// The provider and its hook intentionally live together; this file isn't a
+// component module in the fast-refresh sense.
+// eslint-disable-next-line react-refresh/only-export-components
 export function useStore(): Store {
   const ctx = useContext(StoreContext);
   if (!ctx) throw new Error("useStore must be used within StoreProvider");

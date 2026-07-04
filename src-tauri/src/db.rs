@@ -21,9 +21,33 @@ pub fn open_in_memory() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Idempotent schema creation. Amounts are stored as integer cents to avoid
-/// floating-point rounding errors.
+/// Ordered schema migrations. Each step is applied once, in order, to any
+/// database whose `user_version` is below its (1-based) position; `user_version`
+/// is then advanced so the step never runs again.
+///
+/// Only ever *append* to this list — never edit or reorder an existing step, or
+/// databases in the field will diverge from fresh ones.
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[migrate_v1_baseline];
+
+/// Apply any migrations the database hasn't seen yet.
+///
+/// Databases created before versioning existed report `user_version = 0` and so
+/// run the v1 baseline, which is deliberately idempotent (`CREATE ... IF NOT
+/// EXISTS`, guarded `ALTER`s, seed-if-empty) and safe to run over existing data.
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    while (version as usize) < MIGRATIONS.len() {
+        MIGRATIONS[version as usize](conn)?;
+        version += 1;
+        conn.pragma_update(None, "user_version", version)?;
+    }
+    Ok(())
+}
+
+/// Baseline schema. Amounts are stored as integer cents to avoid floating-point
+/// rounding errors. Idempotent so it can also bring pre-versioning databases up
+/// to the current shape.
+fn migrate_v1_baseline(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS accounts (
@@ -134,4 +158,106 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                params![column],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_database_lands_on_the_latest_version() {
+        let conn = open_in_memory().unwrap();
+        assert_eq!(user_version(&conn), MIGRATIONS.len() as i64);
+        assert!(has_column(&conn, "accounts", "parent_id"));
+        // Default categories are seeded exactly once.
+        let cats: i64 = conn
+            .query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cats, 10);
+    }
+
+    #[test]
+    fn migrating_a_legacy_database_preserves_rows_and_drops_global_unique() {
+        // Reproduce a pre-versioning schema: UNIQUE on name, no parent_id.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE accounts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT    NOT NULL UNIQUE,
+                created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO accounts (name) VALUES ('Checking'), ('Savings');
+            "#,
+        )
+        .unwrap();
+        assert_eq!(user_version(&conn), 0);
+
+        migrate(&conn).unwrap();
+
+        // Schema was upgraded in place.
+        assert!(has_column(&conn, "accounts", "parent_id"));
+        assert_eq!(user_version(&conn), MIGRATIONS.len() as i64);
+        // Existing rows carried over untouched.
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM accounts ORDER BY name")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(names, vec!["Checking", "Savings"]);
+
+        // The global UNIQUE is gone: two subaccounts under different parents may
+        // now share a name...
+        conn.execute(
+            "INSERT INTO accounts (name, parent_id) VALUES ('Sub', 1), ('Sub', 2)",
+            [],
+        )
+        .unwrap();
+        // ...but siblings under the same parent still may not.
+        let dup = conn.execute(
+            "INSERT INTO accounts (name, parent_id) VALUES ('Sub', 1)",
+            [],
+        );
+        assert!(dup.is_err(), "per-parent uniqueness should still hold");
+
+        // Foreign keys survive the table rebuild.
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let conn = open_in_memory().unwrap();
+        let before = user_version(&conn);
+        // Running again is a no-op and must not error or reseed categories.
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(user_version(&conn), before);
+        let cats: i64 = conn
+            .query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cats, 10);
+    }
 }

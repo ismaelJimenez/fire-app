@@ -138,9 +138,7 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
             {isChild && <span className="subaccount-tick">↳</span>}
             {acc.name}
           </button>
-          <span className="acc-balance">
-            {formatMoney(node.rollupBalance)}
-          </span>
+          <span className="acc-balance">{formatMoney(node.rollupBalance)}</span>
           <button
             className="icon-btn"
             onClick={() => openAddSub(acc)}
@@ -265,8 +263,9 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
             />
           </div>
           <p className="muted" style={{ fontSize: 12.5, marginTop: 0 }}>
-            The subaccount starts empty. Add or move transactions into it from the
-            Transactions view; its balance rolls up into “{addingSubTo.name}”.
+            The subaccount starts empty. Add or move transactions into it from
+            the Transactions view; its balance rolls up into “{addingSubTo.name}
+            ”.
           </p>
         </Modal>
       )}
@@ -280,11 +279,7 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
               <button className="btn" onClick={() => setDeleting(null)}>
                 Cancel
               </button>
-              <button
-                className="btn danger"
-                onClick={remove}
-                disabled={saving}
-              >
+              <button className="btn danger" onClick={remove} disabled={saving}>
                 Delete
               </button>
             </>

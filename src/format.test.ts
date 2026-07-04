@@ -1,9 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  formatMoney,
-  parseAmountToCents,
-  centsToInput,
-} from "./format";
+import { formatMoney, parseAmountToCents, centsToInput } from "./format";
 
 describe("parseAmountToCents", () => {
   it("parses plain decimals without float error", () => {

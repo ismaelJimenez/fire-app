@@ -9,7 +9,9 @@ import {
 import type { Account } from "./types";
 
 /** Build an Account with sensible defaults for the fields under test. */
-function acc(partial: Partial<Account> & { id: number; name: string }): Account {
+function acc(
+  partial: Partial<Account> & { id: number; name: string },
+): Account {
   return {
     parent_id: null,
     created_at: "2026-01-01",

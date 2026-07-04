@@ -20,7 +20,7 @@ export function formatMoney(cents: number): string {
  */
 export function parseAmountToCents(value: string): number | null {
   // Strip currency symbols, spaces and thousands separators.
-  const cleaned = value.replace(/[^0-9.\-]/g, "");
+  const cleaned = value.replace(/[^0-9.-]/g, "");
   const negative = cleaned.startsWith("-");
   const body = negative ? cleaned.slice(1) : cleaned;
   if (body === "") return null;
@@ -36,7 +36,8 @@ export function parseAmountToCents(value: string): number | null {
 
   const digit = (i: number) =>
     i < fracPart.length ? fracPart.charCodeAt(i) - 48 : 0;
-  let cents = (intPart === "" ? 0 : Number(intPart)) * 100 + digit(0) * 10 + digit(1);
+  let cents =
+    (intPart === "" ? 0 : Number(intPart)) * 100 + digit(0) * 10 + digit(1);
   if (digit(2) >= 5) cents += 1; // round half-up on the third decimal
 
   return negative ? -cents : cents;

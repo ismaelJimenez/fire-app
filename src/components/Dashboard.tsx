@@ -36,10 +36,7 @@ export function Dashboard({ onNavigate }: Props) {
             Start by creating an account in the sidebar, then import a CSV of
             your transactions or add them manually.
           </p>
-          <button
-            className="btn primary"
-            onClick={() => onNavigate("import")}
-          >
+          <button className="btn primary" onClick={() => onNavigate("import")}>
             Go to import
           </button>
         </div>
@@ -64,8 +61,7 @@ export function Dashboard({ onNavigate }: Props) {
           <div className="label">Total balance</div>
           <div
             className={
-              "value " +
-              (summary && summary.total_balance < 0 ? "neg" : "")
+              "value " + (summary && summary.total_balance < 0 ? "neg" : "")
             }
           >
             {summary ? formatMoney(summary.total_balance) : "—"}
@@ -89,7 +85,9 @@ export function Dashboard({ onNavigate }: Props) {
         </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1.4fr", gap: 20 }}>
+      <div
+        style={{ display: "grid", gridTemplateColumns: "1fr 1.4fr", gap: 20 }}
+      >
         <div>
           <div className="section-title">Accounts</div>
           <div className="card">

@@ -30,9 +30,7 @@ export function TransactionForm({
     tx?.account_id ?? defaultAccountId ?? accounts[0]?.id ?? null,
   );
   const [date, setDate] = useState(tx?.date ?? todayIso());
-  const [sign, setSign] = useState<"-" | "+">(
-    tx && tx.amount > 0 ? "+" : "-",
-  );
+  const [sign, setSign] = useState<"-" | "+">(tx && tx.amount > 0 ? "+" : "-");
   const [amount, setAmount] = useState(
     tx ? Math.abs(tx.amount / 100).toFixed(2) : "",
   );
@@ -40,7 +38,9 @@ export function TransactionForm({
   const [categoryId, setCategoryId] = useState<number | null>(
     tx?.category_id ?? null,
   );
-  const [isTransfer, setIsTransfer] = useState(tx?.is_internal_transfer ?? false);
+  const [isTransfer, setIsTransfer] = useState(
+    tx?.is_internal_transfer ?? false,
+  );
   const [saving, setSaving] = useState(false);
 
   async function save() {

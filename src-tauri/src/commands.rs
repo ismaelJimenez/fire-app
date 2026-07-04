@@ -12,6 +12,35 @@ fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// Return an error unless an account with this id exists. Gives callers a clear
+/// message instead of an opaque foreign-key failure.
+fn ensure_account_exists(conn: &Connection, id: i64) -> CmdResult<()> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM accounts WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(e)?;
+    if exists == 0 {
+        return Err("Account not found".into());
+    }
+    Ok(())
+}
+
+/// Escape LIKE metacharacters (`%`, `_`) and the escape char itself so user
+/// search text matches literally. Pair with `ESCAPE '\'` in the query.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 // ----------------------------------------------------------------------------
 // Accounts
 // ----------------------------------------------------------------------------
@@ -60,16 +89,7 @@ pub fn add_subaccount(state: State<AppState>, parent_id: i64, name: String) -> C
     let conn = state.db.lock().map_err(e)?;
 
     // The parent must exist; new accounts are always leaves, so no cycle is possible.
-    let exists: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM accounts WHERE id = ?1",
-            params![parent_id],
-            |r| r.get(0),
-        )
-        .map_err(e)?;
-    if exists == 0 {
-        return Err("Account not found".into());
-    }
+    ensure_account_exists(&conn, parent_id)?;
 
     conn.execute(
         "INSERT INTO accounts (name, parent_id) VALUES (?1, ?2)",
@@ -222,6 +242,16 @@ pub fn list_transactions(
     search: Option<String>,
 ) -> CmdResult<Vec<Transaction>> {
     let conn = state.db.lock().map_err(e)?;
+    query_transactions(&conn, account_id, search.as_deref())
+}
+
+/// Core of `list_transactions`, decoupled from Tauri state so the filter/search
+/// SQL builder can be tested directly against a `Connection`.
+fn query_transactions(
+    conn: &Connection,
+    account_id: Option<i64>,
+    search: Option<&str>,
+) -> CmdResult<Vec<Transaction>> {
     let mut sql = String::from(TX_SELECT);
     let mut clauses: Vec<String> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
@@ -230,12 +260,13 @@ pub fn list_transactions(
         clauses.push(format!("t.account_id = ?{}", values.len() + 1));
         values.push(Value::Integer(aid));
     }
-    if let Some(q) = search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(q) = search.map(str::trim).filter(|s| !s.is_empty()) {
+        // Escape LIKE wildcards so a search for e.g. "50%" matches literally.
         clauses.push(format!(
-            "(t.description LIKE ?{0} OR c.name LIKE ?{0})",
+            r"(t.description LIKE ?{0} ESCAPE '\' OR c.name LIKE ?{0} ESCAPE '\')",
             values.len() + 1
         ));
-        values.push(Value::Text(format!("%{q}%")));
+        values.push(Value::Text(format!("%{}%", escape_like(q))));
     }
     if !clauses.is_empty() {
         sql.push_str(" WHERE ");
@@ -263,6 +294,7 @@ pub fn create_transaction(
 ) -> CmdResult<i64> {
     validate_date(&date)?;
     let conn = state.db.lock().map_err(e)?;
+    ensure_account_exists(&conn, account_id)?;
     conn.execute(
         "INSERT INTO transactions
             (account_id, date, amount, description, category_id, is_internal_transfer)
@@ -674,6 +706,16 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    /// Insert a minimal transaction with the given description.
+    fn seed_tx(conn: &Connection, account_id: i64, description: &str) {
+        conn.execute(
+            "INSERT INTO transactions (account_id, date, amount, description)
+             VALUES (?1, '2026-01-01', -100, ?2)",
+            params![account_id, description],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn import_inserts_rows_and_creates_categories() {
         let mut conn = db::open_in_memory().unwrap();
@@ -780,5 +822,108 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn deleting_parent_cascades_through_nested_subaccounts() {
+        let conn = db::open_in_memory().unwrap();
+        let parent = seed_account(&conn, "Parent");
+        conn.execute(
+            "INSERT INTO accounts (name, parent_id) VALUES ('Child', ?1)",
+            params![parent],
+        )
+        .unwrap();
+        let child = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO accounts (name, parent_id) VALUES ('Grandchild', ?1)",
+            params![child],
+        )
+        .unwrap();
+        let grandchild = conn.last_insert_rowid();
+        seed_tx(&conn, grandchild, "deep");
+
+        conn.execute("DELETE FROM accounts WHERE id = ?1", params![parent])
+            .unwrap();
+
+        // The cascade recurses through every level, taking the transaction too.
+        let accts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+            .unwrap();
+        let txs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((accts, txs), (0, 0));
+    }
+
+    // --- categories ----------------------------------------------------------
+
+    #[test]
+    fn get_or_create_category_dedupes_case_insensitively() {
+        let conn = db::open_in_memory().unwrap();
+        let a = get_or_create_category(&conn, "Coffee").unwrap();
+        let b = get_or_create_category(&conn, "  coffee ").unwrap();
+        assert_eq!(a, b, "trim + case should map to the same category");
+        // A seeded default is matched, not duplicated.
+        get_or_create_category(&conn, "groceries").unwrap();
+        let dupes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Groceries' COLLATE NOCASE",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dupes, 1);
+        assert!(get_or_create_category(&conn, "   ").is_err());
+    }
+
+    // --- helpers & query builder ---------------------------------------------
+
+    #[test]
+    fn ensure_account_exists_reports_missing_accounts() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        assert!(ensure_account_exists(&conn, acc).is_ok());
+        assert!(ensure_account_exists(&conn, 9999).is_err());
+    }
+
+    #[test]
+    fn escape_like_neutralizes_wildcards() {
+        assert_eq!(escape_like("50%"), r"50\%");
+        assert_eq!(escape_like("a_b"), r"a\_b");
+        assert_eq!(escape_like(r"c\d"), r"c\\d");
+        assert_eq!(escape_like("plain"), "plain");
+    }
+
+    #[test]
+    fn search_matches_wildcard_characters_literally() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        seed_tx(&conn, acc, "50% off sale");
+        seed_tx(&conn, acc, "regular price");
+
+        // Without escaping, "%" would match every row; escaped, it matches one.
+        let hits = query_transactions(&conn, None, Some("50%")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].description, "50% off sale");
+
+        let plain = query_transactions(&conn, None, Some("price")).unwrap();
+        assert_eq!(plain.len(), 1);
+    }
+
+    #[test]
+    fn query_transactions_filters_by_account() {
+        let conn = db::open_in_memory().unwrap();
+        let a = seed_account(&conn, "A");
+        let b = seed_account(&conn, "B");
+        seed_tx(&conn, a, "in a");
+        seed_tx(&conn, b, "in b");
+
+        assert_eq!(query_transactions(&conn, Some(a), None).unwrap().len(), 1);
+        assert_eq!(query_transactions(&conn, None, None).unwrap().len(), 2);
+        // Blank/whitespace search is ignored, not treated as a filter.
+        assert_eq!(
+            query_transactions(&conn, None, Some("  ")).unwrap().len(),
+            2
+        );
     }
 }

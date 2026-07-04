@@ -72,10 +72,7 @@ export function findNode(
 
 /** Total number of subaccounts beneath a node, at every level. */
 export function countDescendantAccounts(node: AccountNode): number {
-  return node.children.reduce(
-    (s, c) => s + 1 + countDescendantAccounts(c),
-    0,
-  );
+  return node.children.reduce((s, c) => s + 1 + countDescendantAccounts(c), 0);
 }
 
 export interface AccountOption {
@@ -92,10 +89,7 @@ export interface AccountOption {
 export function accountSelectOptions(accounts: Account[]): AccountOption[] {
   return flattenTree(buildAccountTree(accounts)).map((n) => ({
     id: n.account.id,
-    label:
-      "  ".repeat(n.depth) +
-      (n.depth > 0 ? "↳ " : "") +
-      n.account.name,
+    label: "  ".repeat(n.depth) + (n.depth > 0 ? "↳ " : "") + n.account.name,
     depth: n.depth,
   }));
 }
