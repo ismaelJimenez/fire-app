@@ -6,7 +6,11 @@ export interface Account {
   /** Parent account this is a subaccount of, or null for a top-level account. */
   parent_id: number | null;
   created_at: string;
-  /** This account's own balance in cents (excludes subaccounts). */
+  /** Starting balance in cents, for accounts with only partial history.
+   *  Included in `balance`; excluded from income/expense totals. */
+  opening_balance: number;
+  /** This account's own balance in cents — opening balance plus its
+   *  transactions (excludes subaccounts). */
   balance: number;
   /** This account's own transaction count (excludes subaccounts). */
   tx_count: number;
@@ -51,6 +55,25 @@ export interface ImportResult {
   imported: number;
   skipped_duplicates: number;
   errors: string[];
+  /** Populated only on a dry run: the outcome each row would have. */
+  preview: ImportPreviewRow[];
+}
+
+/** One parsed row as it would land, computed by a dry run without writing. */
+export interface ImportPreviewRow {
+  date: string;
+  /** Amount in cents; negative = expense. */
+  amount: number;
+  description: string;
+  counterparty: string;
+  /** The category this row would receive, if any. */
+  category: string | null;
+  /** True when the category came from a learned classification rule. */
+  auto_classified: boolean;
+  /** True when importing would create `category` as a brand-new category. */
+  new_category: boolean;
+  /** True when an identical transaction already exists (row would be skipped). */
+  duplicate: boolean;
 }
 
 export interface Summary {

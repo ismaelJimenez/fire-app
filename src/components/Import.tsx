@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
 import * as api from "../api";
 import { accountSelectOptions } from "../accounts";
+import { formatMoney } from "../format";
 import type { ImportResult, View } from "../types";
 
 const TEMPLATE = `date,amount,description,category
@@ -35,7 +36,9 @@ export function Import({ accountId, onNavigate }: Props) {
   const [fileName, setFileName] = useState<string | null>(null);
   const [drag, setDrag] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const [result, setResult] = useState<ImportResult | null>(null);
+  const [preview, setPreview] = useState<ImportResult | null>(null);
   const [detected, setDetected] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -61,6 +64,7 @@ export function Import({ accountId, onNavigate }: Props) {
     setCsv(text);
     setFileName(file.name);
     setResult(null);
+    setPreview(null);
   }
 
   function downloadTemplate() {
@@ -71,6 +75,27 @@ export function Import({ accountId, onNavigate }: Props) {
     a.download = "fire-template.csv";
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  async function runPreview() {
+    if (target == null) {
+      toast("Choose an account to import into", "error");
+      return;
+    }
+    if (!csv.trim()) {
+      toast("Load or paste a CSV first", "error");
+      return;
+    }
+    setPreviewing(true);
+    setResult(null);
+    try {
+      const res = await api.importCsv(target, csv, true);
+      setPreview(res);
+    } catch (err) {
+      toast(String(err), "error");
+    } finally {
+      setPreviewing(false);
+    }
   }
 
   async function runImport() {
@@ -84,6 +109,7 @@ export function Import({ accountId, onNavigate }: Props) {
     }
     setBusy(true);
     setResult(null);
+    setPreview(null);
     try {
       const res = await api.importCsv(target, csv);
       setResult(res);
@@ -213,15 +239,23 @@ export function Import({ accountId, onNavigate }: Props) {
                   setCsv(e.target.value);
                   setFileName(null);
                   setResult(null);
+                  setPreview(null);
                 }}
               />
             </div>
 
             <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
               <button
+                className="btn"
+                onClick={runPreview}
+                disabled={previewing || busy || !csv.trim()}
+              >
+                {previewing ? "Checking…" : "Preview changes"}
+              </button>
+              <button
                 className="btn primary"
                 onClick={runImport}
-                disabled={busy || !csv.trim()}
+                disabled={busy || previewing || !csv.trim()}
               >
                 {busy ? "Importing…" : "Import transactions"}
               </button>
@@ -232,12 +266,135 @@ export function Import({ accountId, onNavigate }: Props) {
                     setCsv("");
                     setFileName(null);
                     setResult(null);
+                    setPreview(null);
                   }}
                 >
                   Clear
                 </button>
               )}
             </div>
+
+            {preview && (
+              <div
+                className="card"
+                style={{
+                  marginTop: 18,
+                  padding: 16,
+                  background: "var(--surface-2)",
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>
+                  Dry run — nothing imported yet
+                </div>
+                <div>
+                  ✅ Would import: <strong>{preview.imported}</strong>
+                </div>
+                <div className="muted">
+                  ⏭ Would skip as duplicates: {preview.skipped_duplicates}
+                </div>
+                {(() => {
+                  const newCats = [
+                    ...new Set(
+                      preview.preview
+                        .filter((r) => r.new_category && r.category)
+                        .map((r) => r.category as string),
+                    ),
+                  ];
+                  return newCats.length > 0 ? (
+                    <div className="muted">
+                      🏷 Would create categor
+                      {newCats.length === 1 ? "y" : "ies"}: {newCats.join(", ")}
+                    </div>
+                  ) : null;
+                })()}
+                {preview.errors.length > 0 && (
+                  <details style={{ marginTop: 8 }}>
+                    <summary style={{ color: "var(--negative)" }}>
+                      {preview.errors.length} row(s) had problems
+                    </summary>
+                    <div className="code-block" style={{ marginTop: 8 }}>
+                      {preview.errors.join("\n")}
+                    </div>
+                  </details>
+                )}
+
+                {preview.preview.length > 0 && (
+                  <div className="table-wrap" style={{ marginTop: 12 }}>
+                    <table style={{ fontSize: 13 }}>
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th>Description</th>
+                          <th style={{ textAlign: "right" }}>Amount</th>
+                          <th>Category</th>
+                          <th>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {preview.preview.map((r, i) => (
+                          <tr
+                            key={i}
+                            style={{ opacity: r.duplicate ? 0.5 : 1 }}
+                          >
+                            <td className="mono">{r.date}</td>
+                            <td>{r.counterparty || r.description || "—"}</td>
+                            <td
+                              className="mono"
+                              style={{
+                                textAlign: "right",
+                                color:
+                                  r.amount < 0
+                                    ? "var(--negative)"
+                                    : "var(--positive)",
+                              }}
+                            >
+                              {formatMoney(r.amount)}
+                            </td>
+                            <td>
+                              {r.category ? (
+                                <>
+                                  {r.category}
+                                  {r.new_category && (
+                                    <span className="muted"> (new)</span>
+                                  )}
+                                  {r.auto_classified && (
+                                    <span className="muted"> · auto</span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="muted">—</span>
+                              )}
+                            </td>
+                            <td>
+                              {r.duplicate ? (
+                                <span className="muted">duplicate</span>
+                              ) : (
+                                <span style={{ color: "var(--positive)" }}>
+                                  new
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {preview.imported > 0 && (
+                  <button
+                    className="btn primary small"
+                    style={{ marginTop: 12 }}
+                    onClick={runImport}
+                    disabled={busy}
+                  >
+                    {busy
+                      ? "Importing…"
+                      : `Import ${preview.imported} transaction(s)`}
+                  </button>
+                )}
+              </div>
+            )}
 
             {result && (
               <div

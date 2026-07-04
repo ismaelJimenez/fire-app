@@ -34,6 +34,7 @@ pub fn run() {
             commands::list_accounts,
             commands::create_account,
             commands::rename_account,
+            commands::set_account_opening_balance,
             commands::delete_account,
             commands::add_subaccount,
             commands::list_categories,

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useStore } from "../store";
 import * as api from "../api";
-import { formatMoney } from "../format";
+import { centsToInput, formatMoney, parseAmountToCents } from "../format";
 import {
   buildAccountTree,
   countDescendantAccounts,
@@ -24,6 +24,9 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
   const [addingSubTo, setAddingSubTo] = useState<Account | null>(null);
   const [name, setName] = useState("");
   const [subName, setSubName] = useState("");
+  // Starting balance as a raw decimal string, shared by the new/rename and the
+  // add-subaccount modals. Empty means "leave at zero".
+  const [opening, setOpening] = useState("");
   const [saving, setSaving] = useState(false);
 
   const tree = buildAccountTree(accounts);
@@ -36,27 +39,51 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
   function openNew() {
     setEditing("new");
     setName("");
+    setOpening("");
   }
   function openRename(acc: Account) {
     setEditing(acc);
     setName(acc.name);
+    setOpening(acc.opening_balance ? centsToInput(acc.opening_balance) : "");
   }
   function openAddSub(acc: Account) {
     setAddingSubTo(acc);
     setSubName("");
+    setOpening("");
+  }
+
+  /** Parse the shared starting-balance input to cents. Returns `null` for a
+   *  blank field (leave at zero) and the sentinel `"invalid"` for junk. */
+  function readOpeningCents(): number | null | "invalid" {
+    if (!opening.trim()) return null;
+    const cents = parseAmountToCents(opening);
+    return cents == null ? "invalid" : cents;
   }
 
   async function save() {
     const trimmed = name.trim();
     if (!trimmed) return;
+    const openingCents = readOpeningCents();
+    if (openingCents === "invalid") {
+      toast("Enter a valid starting balance, or leave it blank", "error");
+      return;
+    }
     setSaving(true);
     try {
       if (editing === "new") {
-        await api.createAccount(trimmed);
+        const id = await api.createAccount(trimmed);
+        if (openingCents != null && openingCents !== 0) {
+          await api.setAccountOpeningBalance(id, openingCents);
+        }
         toast(`Account “${trimmed}” created`);
       } else if (editing) {
         await api.renameAccount(editing.id, trimmed);
-        toast("Account renamed");
+        // A blank field clears the starting balance back to zero.
+        const target = openingCents ?? 0;
+        if (target !== editing.opening_balance) {
+          await api.setAccountOpeningBalance(editing.id, target);
+        }
+        toast("Account updated");
       }
       await refreshAll();
       setEditing(null);
@@ -71,9 +98,17 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
     if (!addingSubTo) return;
     const trimmed = subName.trim();
     if (!trimmed) return;
+    const openingCents = readOpeningCents();
+    if (openingCents === "invalid") {
+      toast("Enter a valid starting balance, or leave it blank", "error");
+      return;
+    }
     setSaving(true);
     try {
-      await api.addSubaccount(addingSubTo.id, trimmed);
+      const id = await api.addSubaccount(addingSubTo.id, trimmed);
+      if (openingCents != null && openingCents !== 0) {
+        await api.setAccountOpeningBalance(id, openingCents);
+      }
       toast(`Subaccount “${trimmed}” added to “${addingSubTo.name}”`);
       await refreshAll();
       setAddingSubTo(null);
@@ -191,7 +226,7 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
 
       {editing && (
         <Modal
-          title={editing === "new" ? "New account" : "Rename account"}
+          title={editing === "new" ? "New account" : "Edit account"}
           onClose={() => setEditing(null)}
           footer={
             <>
@@ -230,6 +265,22 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
               placeholder="e.g. Checking, Savings, Credit Card"
             />
           </div>
+          <div className="field">
+            <label>Starting balance</label>
+            <input
+              inputMode="decimal"
+              value={opening}
+              onChange={(e) => setOpening(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && save()}
+              placeholder="0.00"
+              style={{ textAlign: "right" }}
+            />
+            <p className="muted" style={{ fontSize: 12.5, marginTop: 6 }}>
+              The balance before your earliest transaction. Set this when you’re
+              only importing part of the account’s history. It counts toward the
+              balance but not income or expenses.
+            </p>
+          </div>
         </Modal>
       )}
 
@@ -262,10 +313,21 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
               placeholder="e.g. Checking, Savings, Brokerage"
             />
           </div>
+          <div className="field">
+            <label>Starting balance</label>
+            <input
+              inputMode="decimal"
+              value={opening}
+              onChange={(e) => setOpening(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addSub()}
+              placeholder="0.00"
+              style={{ textAlign: "right" }}
+            />
+          </div>
           <p className="muted" style={{ fontSize: 12.5, marginTop: 0 }}>
-            The subaccount starts empty. Add or move transactions into it from
-            the Transactions view; its balance rolls up into “{addingSubTo.name}
-            ”.
+            The subaccount starts with no transactions; set a starting balance
+            if you’re only importing part of its history. Its balance rolls up
+            into “{addingSubTo.name}”.
           </p>
         </Modal>
       )}

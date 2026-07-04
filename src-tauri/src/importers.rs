@@ -25,6 +25,11 @@ pub(crate) struct ParsedRow {
     /// An explicit category named in the file (canonical format only). Bank
     /// exports leave this `None` and rely on learned classification rules.
     pub category: Option<String>,
+    /// A stable per-transaction reference from the bank (e.g. comdirect's
+    /// `Referenz`), when the export carries one. Empty otherwise. Used as the
+    /// duplicate-detection identity so two genuinely distinct charges that share a
+    /// date, amount, and merchant aren't collapsed into one.
+    pub import_ref: String,
 }
 
 /// The CSV dialects we know how to read.
@@ -136,6 +141,7 @@ fn parse_canonical(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> 
             counterparty: String::new(),
             description: record.get(desc_i).unwrap_or("").trim().to_string(),
             category,
+            import_ref: String::new(),
         });
     }
     Ok((rows, errors))
@@ -215,6 +221,9 @@ fn parse_ing(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
             counterparty,
             description,
             category: None,
+            // The ING Girokonto export has no dedicated reference column; its
+            // Verwendungszweck already distinguishes otherwise-identical rows.
+            import_ref: String::new(),
         });
     }
     Ok((rows, errors))
@@ -252,6 +261,15 @@ fn parse_comdirect(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> 
         idx("Umsatz in EUR").ok_or("comdirect CSV is missing the 'Umsatz in EUR' column")?;
     let vorgang_i = idx("Vorgang");
     let text_i = idx("Buchungstext");
+    // The Visa export carries a per-transaction "Referenz" the Girokonto export
+    // lacks; we use it as the duplicate key so repeated same-day, same-amount
+    // charges at one merchant aren't collapsed into a single row.
+    let ref_i = idx("Referenz");
+    // Visa-Karte (credit-card) exports add an "Umsatztag" column and don't book
+    // recent rows yet: those carry a non-date Buchungstag ("offen"/"neu") and are
+    // split across two physical lines — a bare `"<date>";` line with no amount,
+    // then the real row. Its presence flags the card dialect.
+    let umsatztag_i = idx("Umsatztag");
 
     let mut rows = Vec::new();
     let mut errors = Vec::new();
@@ -271,14 +289,33 @@ fn parse_comdirect(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> 
             continue;
         }
 
-        let date = match normalize_date(record.get(date_i).unwrap_or("").trim()) {
+        // A row with no amount is not a transaction: either the Visa export's bare
+        // `"<date>";` continuation line or a stray preamble line. Skip it silently.
+        let raw_amount = record.get(amount_i).map(str::trim).unwrap_or("");
+        if raw_amount.is_empty() {
+            continue;
+        }
+
+        // Buchungstag holds a date for booked rows but the literal "offen"/"neu"
+        // for not-yet-booked card rows; fall back to Umsatztag (the purchase date)
+        // when it isn't a date.
+        let raw_date = record.get(date_i).unwrap_or("").trim();
+        let date_src = if normalize_date(raw_date).is_ok() {
+            raw_date
+        } else {
+            umsatztag_i
+                .and_then(|i| record.get(i))
+                .map(str::trim)
+                .unwrap_or(raw_date)
+        };
+        let date = match normalize_date(date_src) {
             Ok(d) => d,
             Err(err) => {
                 errors.push(format!("Row {line}: {err}"));
                 continue;
             }
         };
-        let amount_cents = match parse_de_amount_cents(record.get(amount_i).unwrap_or("").trim()) {
+        let amount_cents = match parse_de_amount_cents(raw_amount) {
             Ok(a) => a,
             Err(err) => {
                 errors.push(format!("Row {line}: {err}"));
@@ -295,12 +332,32 @@ fn parse_comdirect(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> 
             .unwrap_or("")
             .trim();
 
+        // On a card export the payee is the merchant in Buchungstext itself; the
+        // Girokonto export instead embeds it behind Auftraggeber:/Empfänger: labels.
+        let counterparty = if umsatztag_i.is_some() {
+            let merchant = canonical_merchant(buchungstext);
+            if merchant.is_empty() {
+                normalize_concept(vorgang)
+            } else {
+                merchant
+            }
+        } else {
+            comdirect_counterparty(buchungstext, vorgang)
+        };
+
+        let import_ref = ref_i
+            .and_then(|i| record.get(i))
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+
         rows.push(ParsedRow {
             date,
             amount_cents,
-            counterparty: comdirect_counterparty(buchungstext, vorgang),
+            counterparty,
             description: normalize_concept(buchungstext),
             category: None,
+            import_ref,
         });
     }
     Ok((rows, errors))
@@ -333,6 +390,26 @@ fn comdirect_counterparty(buchungstext: &str, vorgang: &str) -> String {
 /// transaction and as the classification-rule key.
 pub(crate) fn normalize_concept(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Turn a card merchant string into a stable classification concept.
+///
+/// Card exports tack a per-purchase order/authorization token onto the merchant
+/// (e.g. `AMZN Mktp DE H110A8TU5`), and one payee can appear under several brand
+/// strings. Left alone, every purchase gets a unique concept and a learned
+/// classification rule never generalizes. We fold the known multi-name brands to a
+/// single label so one rule covers them all; everything else is just whitespace-
+/// normalized (its full text preserved, since store numbers like `Rossmann 298`
+/// are stable and meaningful).
+pub(crate) fn canonical_merchant(raw: &str) -> String {
+    let concept = normalize_concept(raw);
+    let lower = concept.to_lowercase();
+    // Amazon bills as "AMZN Mktp DE …", "Amazon.de …", "AMAZON PRIM …",
+    // "WWW.AMAZON. …", "AMAZON …", "AMZN.COM/BILL" — all the same payee here.
+    if lower.contains("amazon") || lower.contains("amzn") {
+        return "Amazon".to_string();
+    }
+    concept
 }
 
 pub(crate) fn validate_date(date: &str) -> Result<(), String> {
@@ -556,6 +633,7 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
                 counterparty: "Ismael Jimenez Martinez".into(),
                 description: "Echtzeitüberweisung".into(),
                 category: None,
+                import_ref: String::new(),
             }
         );
         assert_eq!(rows[1].counterparty, "BMW Car IT GmbH");
@@ -649,6 +727,83 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         assert!(err.contains("header"), "unexpected error: {err}");
     }
 
+    // The Visa-Karte export differs from the Girokonto one: an extra "Umsatztag"
+    // column, a "Referenz" column, a non-date Buchungstag ("offen"/"neu") on
+    // unbooked rows, and each unbooked row split across a bare `"<date>";` line
+    // plus the real row. The merchant lives directly in Buchungstext.
+    const COMDIRECT_VISA_SAMPLE: &str = "\
+;\n\
+\"Umsätze Visa-Karte (Kreditkarte) ..9255 (Ismael)\";\"Zeitraum: 01.01.2026 - 25.06.2026\";\n\
+\"Neuer Kontostand\";\"2.710,34 EUR\";\n\
+\n\
+\"Buchungstag\";\"Umsatztag\";\"Vorgang\";\"Referenz\";\"Buchungstext\";\"Umsatz in EUR\";\n\
+\"offen\";\"24.06.2026\";\"Kartenumsatz\";\"151420018103\";\" ALDI NORD// BREMERHAVEN/ DEU \";\"-82,03\";\n\
+\"24.06.2026\";\"23.06.2026\";\"Kartenumsatz\";\"151150884903\";\" STADTBAECKEREI ENGELBR \";\"-7,90\";\n\
+\"22.06.2026\";\"22.06.2026\";\"Uebertrag auf Visa-Karte\";\"150528448003\";\" Uebertrag auf Visa-Karte \";\"2.000,00\";\n\
+\"13.01.2026\";\n\
+\"neu\";\"12.01.2026\";\"Kartenumsatz\";\"110092508203\";\" Amazon.de Z73G55TA4 \";\"-5,95\";\n\
+\n\
+\"Alter Kontostand\";\"1.958,12 EUR\";\n";
+
+    #[test]
+    fn detects_comdirect_visa() {
+        assert_eq!(detect_format(COMDIRECT_VISA_SAMPLE), BankFormat::Comdirect);
+    }
+
+    #[test]
+    fn parses_comdirect_visa_export() {
+        let (rows, errors) = parse(COMDIRECT_VISA_SAMPLE).unwrap();
+        // The bare `"13.01.2026";` continuation line and the balance trailer must
+        // not surface as bad rows.
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(rows.len(), 4);
+
+        // Unbooked ("offen") row: Buchungstag isn't a date, so fall back to
+        // Umsatztag. Merchant lifted straight from Buchungstext.
+        assert_eq!(rows[0].date, "2026-06-24");
+        assert_eq!(rows[0].amount_cents, -8203);
+        assert_eq!(rows[0].counterparty, "ALDI NORD// BREMERHAVEN/ DEU");
+        assert_eq!(rows[0].description, "ALDI NORD// BREMERHAVEN/ DEU");
+        // The Referenz column is captured as the duplicate-detection key.
+        assert_eq!(rows[0].import_ref, "151420018103");
+
+        // Booked row uses the (date) Buchungstag directly.
+        assert_eq!(rows[1].date, "2026-06-24");
+        assert_eq!(rows[1].counterparty, "STADTBAECKEREI ENGELBR");
+
+        // A positive top-up (Uebertrag) is income; falls back through Buchungstext.
+        assert_eq!(rows[2].amount_cents, 200000);
+
+        // "neu" row: date comes from Umsatztag (12.01), not the "neu" Buchungstag.
+        assert_eq!(rows[3].date, "2026-01-12");
+        // The Amazon merchant folds to a stable concept for classification, while
+        // the description keeps the full original text (order token and all).
+        assert_eq!(rows[3].counterparty, "Amazon");
+        assert_eq!(rows[3].description, "Amazon.de Z73G55TA4");
+    }
+
+    #[test]
+    fn canonical_merchant_folds_amazon_variants() {
+        // Every Amazon brand string + per-order token collapses to one concept.
+        for raw in [
+            " AMZN Mktp DE XC4KJ1U65 ",
+            " Amazon.de O59H84AO5 ",
+            " AMAZON PRIM GM2182O25 ",
+            " WWW.AMAZON. NR94D9LQ4 ",
+            " AMAZON 0U63D7LA5 ",
+            " AMZN Mktp DE// AMZN.COM/BILL/ LUX ",
+        ] {
+            assert_eq!(canonical_merchant(raw), "Amazon", "for {raw:?}");
+        }
+        // Non-Amazon merchants are only whitespace-normalized; stable store numbers
+        // and other tokens are preserved so distinct shops stay distinct.
+        assert_eq!(canonical_merchant("  Rossmann   298 "), "Rossmann 298");
+        assert_eq!(
+            canonical_merchant(" STADTBAECKEREI ENGELBR "),
+            "STADTBAECKEREI ENGELBR"
+        );
+    }
+
     // --- canonical parsing ---------------------------------------------------
 
     #[test]
@@ -665,6 +820,7 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
                 counterparty: String::new(),
                 description: "Grocery store".into(),
                 category: Some("Groceries".into()),
+                import_ref: String::new(),
             }
         );
     }

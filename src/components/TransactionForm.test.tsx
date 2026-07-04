@@ -16,6 +16,7 @@ const accounts: Account[] = [
     name: "Checking",
     parent_id: null,
     created_at: "2026-01-01",
+    opening_balance: 0,
     balance: 0,
     tx_count: 0,
   },

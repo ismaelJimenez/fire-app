@@ -14,6 +14,9 @@ export const createAccount = (name: string) =>
   invoke<number>("create_account", { name });
 export const renameAccount = (id: number, name: string) =>
   invoke<void>("rename_account", { id, name });
+/** Set an account's starting balance (cents); pass 0 to clear it. */
+export const setAccountOpeningBalance = (id: number, openingBalance: number) =>
+  invoke<void>("set_account_opening_balance", { id, openingBalance });
 export const deleteAccount = (id: number) =>
   invoke<void>("delete_account", { id });
 export const addSubaccount = (parentId: number, name: string) =>
@@ -76,7 +79,7 @@ export const deleteRule = (id: number) => invoke<void>("delete_rule", { id });
 
 // Summary + import
 export const getSummary = () => invoke<Summary>("get_summary");
-export const importCsv = (accountId: number, csvText: string) =>
-  invoke<ImportResult>("import_csv", { accountId, csvText });
+export const importCsv = (accountId: number, csvText: string, dryRun = false) =>
+  invoke<ImportResult>("import_csv", { accountId, csvText, dryRun });
 export const detectBank = (csvText: string) =>
   invoke<string>("detect_bank", { csvText });

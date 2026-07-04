@@ -14,6 +14,7 @@ function acc(p: Partial<Account> & { id: number; name: string }): Account {
   return {
     parent_id: null,
     created_at: "2026-01-01",
+    opening_balance: 0,
     balance: 0,
     tx_count: 0,
     ...p,
@@ -76,12 +77,60 @@ describe("Sidebar", () => {
     const dialog = screen
       .getByText("New account")
       .closest(".modal") as HTMLElement;
-    await user.type(within(dialog).getByRole("textbox"), "Credit Card");
+    await user.type(
+      within(dialog).getByPlaceholderText(/Checking, Savings, Credit Card/),
+      "Credit Card",
+    );
     await user.click(within(dialog).getByRole("button", { name: "Create" }));
 
     await waitFor(() =>
       expect(api.createAccount).toHaveBeenCalledWith("Credit Card"),
     );
+    // No starting balance entered, so it is left untouched.
+    expect(api.setAccountOpeningBalance).not.toHaveBeenCalled();
     expect(refreshAll).toHaveBeenCalled();
+  });
+
+  it("sets a starting balance when creating an account", async () => {
+    vi.mocked(api.createAccount).mockResolvedValue(3);
+    renderSidebar();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTitle("New account"));
+    const dialog = screen
+      .getByText("New account")
+      .closest(".modal") as HTMLElement;
+    await user.type(
+      within(dialog).getByPlaceholderText(/Checking, Savings, Credit Card/),
+      "Credit Card",
+    );
+    await user.type(within(dialog).getByPlaceholderText("0.00"), "1234.56");
+    await user.click(within(dialog).getByRole("button", { name: "Create" }));
+
+    await waitFor(() =>
+      expect(api.setAccountOpeningBalance).toHaveBeenCalledWith(3, 123456),
+    );
+  });
+
+  it("prefills and updates an existing account's starting balance", async () => {
+    renderSidebar();
+    const user = userEvent.setup();
+
+    // Edit "Checking" (own balance 100.00, opening 0). Open its edit modal.
+    const checkingRow = screen
+      .getByRole("button", { name: /Checking/ })
+      .closest(".account-row") as HTMLElement;
+    await user.click(within(checkingRow).getByTitle("Edit"));
+
+    const dialog = screen
+      .getByText("Edit account")
+      .closest(".modal") as HTMLElement;
+    const opening = within(dialog).getByPlaceholderText("0.00");
+    await user.type(opening, "500");
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(api.setAccountOpeningBalance).toHaveBeenCalledWith(1, 50000),
+    );
   });
 });

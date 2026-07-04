@@ -32,6 +32,12 @@ describe("api command/argument mapping", () => {
       name: "Savings",
     });
 
+    api.setAccountOpeningBalance(3, 50000);
+    expect(mockInvoke).toHaveBeenLastCalledWith("set_account_opening_balance", {
+      id: 3,
+      openingBalance: 50000,
+    });
+
     api.deleteAccount(3);
     expect(mockInvoke).toHaveBeenLastCalledWith("delete_account", { id: 3 });
 
@@ -114,6 +120,14 @@ describe("api command/argument mapping", () => {
     expect(mockInvoke).toHaveBeenLastCalledWith("import_csv", {
       accountId: 4,
       csvText: "date,amount\n2026-01-01,-1.00\n",
+      dryRun: false,
+    });
+
+    api.importCsv(4, "date,amount\n2026-01-01,-1.00\n", true);
+    expect(mockInvoke).toHaveBeenLastCalledWith("import_csv", {
+      accountId: 4,
+      csvText: "date,amount\n2026-01-01,-1.00\n",
+      dryRun: true,
     });
   });
 

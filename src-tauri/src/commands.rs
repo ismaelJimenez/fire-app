@@ -1,8 +1,11 @@
 use crate::importers::{self, validate_date};
-use crate::models::{Account, Category, ClassificationRule, ImportResult, Summary, Transaction};
+use crate::models::{
+    Account, Category, ClassificationRule, ImportPreviewRow, ImportResult, Summary, Transaction,
+};
 use crate::AppState;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use std::collections::HashSet;
 use tauri::State;
 
 type CmdResult<T> = Result<T, String>;
@@ -48,12 +51,13 @@ fn escape_like(s: &str) -> String {
 #[tauri::command]
 pub fn list_accounts(state: State<AppState>) -> CmdResult<Vec<Account>> {
     let conn = state.db.lock().map_err(e)?;
-    // `balance` and `tx_count` are each account's own transactions only; the
-    // front end rolls a parent's subaccounts up for display.
+    // `balance` (opening balance plus each account's own transactions) and
+    // `tx_count` cover the account itself only; the front end rolls a parent's
+    // subaccounts up for display.
     let mut stmt = conn
         .prepare(
-            "SELECT a.id, a.name, a.parent_id, a.created_at,
-                    COALESCE(SUM(t.amount), 0) AS balance,
+            "SELECT a.id, a.name, a.parent_id, a.created_at, a.opening_balance,
+                    a.opening_balance + COALESCE(SUM(t.amount), 0) AS balance,
                     COUNT(t.id) AS tx_count
              FROM accounts a
              LEFT JOIN transactions t ON t.account_id = a.id
@@ -68,8 +72,9 @@ pub fn list_accounts(state: State<AppState>) -> CmdResult<Vec<Account>> {
                 name: r.get(1)?,
                 parent_id: r.get(2)?,
                 created_at: r.get(3)?,
-                balance: r.get(4)?,
-                tx_count: r.get(5)?,
+                opening_balance: r.get(4)?,
+                balance: r.get(5)?,
+                tx_count: r.get(6)?,
             })
         })
         .map_err(e)?;
@@ -144,6 +149,28 @@ pub fn rename_account(state: State<AppState>, id: i64, name: String) -> CmdResul
         }
         other => e(other),
     })?;
+    Ok(())
+}
+
+/// Set an account's starting balance, in cents.
+///
+/// Bank exports are often partial — they only reach back so far — so this lets a
+/// user anchor an account to a known figure. The opening balance is added to the
+/// transaction sum for the displayed balance and the dashboard total, but is
+/// never counted as income or expense. Pass `0` to clear it.
+#[tauri::command]
+pub fn set_account_opening_balance(
+    state: State<AppState>,
+    id: i64,
+    opening_balance: i64,
+) -> CmdResult<()> {
+    let conn = state.db.lock().map_err(e)?;
+    ensure_account_exists(&conn, id)?;
+    conn.execute(
+        "UPDATE accounts SET opening_balance = ?1 WHERE id = ?2",
+        params![opening_balance, id],
+    )
+    .map_err(e)?;
     Ok(())
 }
 
@@ -509,13 +536,22 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
     // category (flagged `is_transfer`, not matched by name); those rows are left
     // out of income/expense totals but still count toward balances. `IS NOT` is
     // null-safe, so uncategorized rows (category_id IS NULL) are kept.
+    // Balance is every transaction plus every account's starting balance, so the
+    // dashboard total matches the sum of the per-account balances.
     let total_balance: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(amount), 0) FROM transactions",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0),
         )
-        .map_err(e)?;
+        .map_err(e)?
+        + conn
+            .query_row(
+                "SELECT COALESCE(SUM(opening_balance), 0) FROM accounts",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(e)?;
     let income: i64 = conn
         .query_row(
             "SELECT COALESCE(SUM(amount), 0) FROM transactions
@@ -580,17 +616,24 @@ pub fn import_csv(
     state: State<AppState>,
     account_id: i64,
     csv_text: String,
+    dry_run: bool,
 ) -> CmdResult<ImportResult> {
     let mut conn = state.db.lock().map_err(e)?;
-    import_csv_into(&mut conn, account_id, &csv_text)
+    import_csv_into(&mut conn, account_id, &csv_text, dry_run)
 }
 
 /// Core of `import_csv`, decoupled from Tauri state so it can be tested directly
 /// against a `Connection`.
+///
+/// With `dry_run` set nothing is written: no categories are created, no rows are
+/// inserted, and the transaction is rolled back. Instead `result.preview` is filled
+/// with the outcome each parsed row *would* have, so the UI can show the user what
+/// committing would do.
 fn import_csv_into(
     conn: &mut Connection,
     account_id: i64,
     csv_text: &str,
+    dry_run: bool,
 ) -> CmdResult<ImportResult> {
     let (rows, mut errors) = importers::parse(csv_text)?;
 
@@ -598,65 +641,163 @@ fn import_csv_into(
         imported: 0,
         skipped_duplicates: 0,
         errors: Vec::new(),
+        preview: Vec::new(),
     };
+
+    // On a dry run nothing is committed, so the DB duplicate check can't see rows
+    // earlier in this same file. Track their identity keys here so an in-file repeat
+    // still reads as a duplicate, matching what a real import (which sees its own
+    // inserts) does.
+    let mut seen: HashSet<String> = HashSet::new();
 
     let tx = conn.transaction().map_err(e)?;
     for row in &rows {
         // Category precedence: explicit column, then a learned rule for the
         // concept, then nothing. `is_auto_classified` marks rule-driven matches.
-        let (category_id, auto): (Option<i64>, bool) = if let Some(name) = &row.category {
-            match get_or_create_category(&tx, name) {
-                Ok(id) => (Some(id), false),
-                Err(err) => {
-                    errors.push(err);
-                    (None, false)
+        // `new_category` flags an explicit category that doesn't exist yet.
+        let (category_id, category_name, auto, new_category): (
+            Option<i64>,
+            Option<String>,
+            bool,
+            bool,
+        ) = if let Some(name) = &row.category {
+            if dry_run {
+                let existing = find_category(&tx, name)?;
+                (existing, Some(name.clone()), false, existing.is_none())
+            } else {
+                match get_or_create_category(&tx, name) {
+                    Ok(id) => (Some(id), Some(name.clone()), false, false),
+                    Err(err) => {
+                        errors.push(err);
+                        (None, None, false, false)
+                    }
                 }
             }
         } else if !row.counterparty.trim().is_empty() {
             match lookup_rule(&tx, &row.counterparty)? {
-                Some(id) => (Some(id), true),
-                None => (None, false),
+                Some(id) => (Some(id), category_name_by_id(&tx, id)?, true, false),
+                None => (None, None, false, false),
             }
         } else {
-            (None, false)
+            (None, None, false, false)
         };
 
-        // Duplicate guard (also makes re-import of a verified row a no-op).
-        let exists: bool = tx
-            .query_row(
+        // Duplicate guard (also makes re-import of a verified row a no-op). When the
+        // export carries a per-transaction reference, that is the identity — so two
+        // genuinely distinct charges sharing a date, amount, and merchant are kept
+        // apart. Rows without a reference (and legacy rows imported before references
+        // existed) fall back to the date/amount/description identity.
+        let has_ref = !row.import_ref.is_empty();
+        let exists_in_db: bool = if has_ref {
+            tx.query_row(
+                "SELECT 1 FROM transactions
+                 WHERE account_id = ?1
+                   AND (import_ref = ?2
+                        OR (import_ref = '' AND date = ?3 AND amount = ?4 AND description = ?5))
+                 LIMIT 1",
+                params![
+                    account_id,
+                    row.import_ref,
+                    row.date,
+                    row.amount_cents,
+                    row.description
+                ],
+                |_| Ok(()),
+            )
+            .is_ok()
+        } else {
+            tx.query_row(
                 "SELECT 1 FROM transactions
                  WHERE account_id = ?1 AND date = ?2 AND amount = ?3 AND description = ?4
                  LIMIT 1",
                 params![account_id, row.date, row.amount_cents, row.description],
                 |_| Ok(()),
             )
-            .is_ok();
+            .is_ok()
+        };
+
+        // On a dry run nothing is committed, so the DB check can't see rows earlier
+        // in this same file; track them here so an in-file repeat still reads as a
+        // duplicate, matching a real import (which sees its own inserts). Keyed by
+        // reference when there is one, otherwise by date/amount/description.
+        let seen_key = if has_ref {
+            format!("ref:{}", row.import_ref)
+        } else {
+            format!("{}|{}|{}", row.date, row.amount_cents, row.description)
+        };
+        let exists = exists_in_db || (dry_run && !seen.insert(seen_key));
+
+        if dry_run {
+            result.preview.push(ImportPreviewRow {
+                date: row.date.clone(),
+                amount: row.amount_cents,
+                description: row.description.clone(),
+                counterparty: row.counterparty.clone(),
+                category: category_name,
+                auto_classified: auto,
+                new_category: new_category && !exists,
+                duplicate: exists,
+            });
+        }
+
         if exists {
             result.skipped_duplicates += 1;
             continue;
         }
 
-        tx.execute(
-            "INSERT INTO transactions
-                (account_id, date, amount, description, counterparty, category_id, is_auto_classified)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                account_id,
-                row.date,
-                row.amount_cents,
-                row.description,
-                row.counterparty,
-                category_id,
-                auto as i64
-            ],
-        )
-        .map_err(e)?;
+        if !dry_run {
+            tx.execute(
+                "INSERT INTO transactions
+                    (account_id, date, amount, description, counterparty, category_id, is_auto_classified, import_ref)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    account_id,
+                    row.date,
+                    row.amount_cents,
+                    row.description,
+                    row.counterparty,
+                    category_id,
+                    auto as i64,
+                    row.import_ref
+                ],
+            )
+            .map_err(e)?;
+        }
         result.imported += 1;
     }
-    tx.commit().map_err(e)?;
+
+    // A dry run rolls back (drop without commit); a real run persists.
+    if dry_run {
+        tx.rollback().map_err(e)?;
+    } else {
+        tx.commit().map_err(e)?;
+    }
 
     result.errors = errors;
     Ok(result)
+}
+
+/// Read-only lookup of a category id by name (case-insensitive). Unlike
+/// [`get_or_create_category`], never creates — used by dry-run preview.
+fn find_category(conn: &Connection, name: &str) -> CmdResult<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM categories WHERE name = ?1 COLLATE NOCASE",
+        params![name.trim()],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(e)
+}
+
+/// The display name of a category by id, if it still exists.
+fn category_name_by_id(conn: &Connection, id: i64) -> CmdResult<Option<String>> {
+    conn.query_row(
+        "SELECT name FROM categories WHERE id = ?1",
+        params![id],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(e)
 }
 
 // ----------------------------------------------------------------------------
@@ -695,7 +836,7 @@ mod tests {
                    2026-01-05,-42.90,Grocery store,Groceries\n\
                    2026-01-06,1500.00,Salary,Income\n";
 
-        let result = import_csv_into(&mut conn, acc, csv).unwrap();
+        let result = import_csv_into(&mut conn, acc, csv, false).unwrap();
         assert_eq!(result.imported, 2);
         assert_eq!(result.skipped_duplicates, 0);
         assert!(result.errors.is_empty());
@@ -722,12 +863,148 @@ mod tests {
         let acc = seed_account(&conn, "Checking");
         let csv = "date,amount,description\n2026-01-05,-42.90,Grocery store\n";
 
-        let first = import_csv_into(&mut conn, acc, csv).unwrap();
+        let first = import_csv_into(&mut conn, acc, csv, false).unwrap();
         assert_eq!(first.imported, 1);
 
-        let second = import_csv_into(&mut conn, acc, csv).unwrap();
+        let second = import_csv_into(&mut conn, acc, csv, false).unwrap();
         assert_eq!(second.imported, 0);
         assert_eq!(second.skipped_duplicates, 1);
+    }
+
+    #[test]
+    fn dry_run_writes_nothing_but_previews_every_row() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let csv = "date,amount,description,category\n\
+                   2026-01-05,-42.90,Grocery store,Groceries\n\
+                   2026-01-06,1500.00,Salary,A Brand New Category\n";
+
+        let res = import_csv_into(&mut conn, acc, csv, true).unwrap();
+        assert_eq!(res.imported, 2);
+        assert_eq!(res.skipped_duplicates, 0);
+        assert_eq!(res.preview.len(), 2);
+
+        // Nothing was written: no transactions and no new category.
+        let tx_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tx_count, 0);
+        let brand_new: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'A Brand New Category'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(brand_new, 0);
+
+        // Groceries is a seeded default, so it isn't flagged new; the second row's
+        // category would be created.
+        assert_eq!(res.preview[0].category.as_deref(), Some("Groceries"));
+        assert!(!res.preview[0].new_category);
+        assert_eq!(
+            res.preview[1].category.as_deref(),
+            Some("A Brand New Category")
+        );
+        assert!(res.preview[1].new_category);
+    }
+
+    #[test]
+    fn dry_run_flags_existing_and_in_file_duplicates() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let csv = "date,amount,description\n2026-01-05,-42.90,Grocery store\n";
+        import_csv_into(&mut conn, acc, csv, false).unwrap();
+
+        // Re-previewing the already-imported row, plus a repeat within the same file.
+        let csv2 = "date,amount,description\n\
+                    2026-01-05,-42.90,Grocery store\n\
+                    2026-02-01,-9.99,New one\n\
+                    2026-02-01,-9.99,New one\n";
+        let res = import_csv_into(&mut conn, acc, csv2, true).unwrap();
+        assert_eq!(res.imported, 1);
+        assert_eq!(res.skipped_duplicates, 2);
+        // Row 0 duplicates the DB; row 3 duplicates row 2 within the file.
+        assert!(res.preview[0].duplicate);
+        assert!(!res.preview[1].duplicate);
+        assert!(res.preview[2].duplicate);
+    }
+
+    #[test]
+    fn dry_run_surfaces_learned_classification() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        // Import an ING row, then teach a rule for its counterparty.
+        import_csv_into(&mut conn, acc, ING, false).unwrap();
+        let cat = get_or_create_category(&conn, "Salary").unwrap();
+        upsert_rule(&conn, "BMW Car IT GmbH", cat).unwrap();
+
+        // A fresh (non-duplicate) ING row from the same payee previews as auto-classified.
+        let ing2 = "Umsatzanzeige;x\n\n\
+            Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck;Saldo;Währung;Betrag;Währung\n\
+            20.06.2026;20.06.2026;BMW Car IT GmbH;Gehalt/Rente;July pay;100,00;EUR;5.000,00;EUR\n";
+        let res = import_csv_into(&mut conn, acc, ing2, true).unwrap();
+        assert_eq!(res.preview.len(), 1);
+        assert_eq!(res.preview[0].category.as_deref(), Some("Salary"));
+        assert!(res.preview[0].auto_classified);
+        assert!(!res.preview[0].duplicate);
+    }
+
+    // A comdirect Visa export where several genuinely distinct charges share a
+    // date, amount, and merchant — distinguished only by their Referenz. Keying
+    // duplicates on the reference must keep all of them.
+    const VISA_REPEATS: &str = "\
+;\n\
+\"Umsätze Visa-Karte (Kreditkarte) ..9255\";\"Zeitraum\";\n\
+\"Neuer Kontostand\";\"0,00 EUR\";\n\
+\n\
+\"Buchungstag\";\"Umsatztag\";\"Vorgang\";\"Referenz\";\"Buchungstext\";\"Umsatz in EUR\";\n\
+\"16.05.2026\";\"16.05.2026\";\"Kartenumsatz\";\"140803816503\";\" NYX HAPPYGAMESSL \";\"-1,00\";\n\
+\"16.05.2026\";\"16.05.2026\";\"Kartenumsatz\";\"140787949803\";\" NYX HAPPYGAMESSL \";\"-1,00\";\n\
+\"16.05.2026\";\"16.05.2026\";\"Kartenumsatz\";\"140785418703\";\" NYX HAPPYGAMESSL \";\"-1,00\";\n";
+
+    #[test]
+    fn import_keeps_distinct_charges_with_different_references() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Visa");
+
+        // All three are distinct despite identical date/amount/merchant.
+        let res = import_csv_into(&mut conn, acc, VISA_REPEATS, false).unwrap();
+        assert_eq!(res.imported, 3);
+        assert_eq!(res.skipped_duplicates, 0);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Re-importing the same file is still idempotent — the references match.
+        let again = import_csv_into(&mut conn, acc, VISA_REPEATS, false).unwrap();
+        assert_eq!(again.imported, 0);
+        assert_eq!(again.skipped_duplicates, 3);
+    }
+
+    #[test]
+    fn dry_run_previews_reference_repeats_as_new() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Visa");
+        let res = import_csv_into(&mut conn, acc, VISA_REPEATS, true).unwrap();
+        assert_eq!(res.imported, 3);
+        assert_eq!(res.skipped_duplicates, 0);
+        assert!(res.preview.iter().all(|r| !r.duplicate));
+    }
+
+    #[test]
+    fn import_dedupes_repeated_reference_within_one_file() {
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Visa");
+        // The same Referenz twice in one file is a true duplicate.
+        let csv = "\
+\"Buchungstag\";\"Umsatztag\";\"Vorgang\";\"Referenz\";\"Buchungstext\";\"Umsatz in EUR\";\n\
+\"16.05.2026\";\"16.05.2026\";\"Kartenumsatz\";\"140803816503\";\" NYX HAPPYGAMESSL \";\"-1,00\";\n\
+\"16.05.2026\";\"16.05.2026\";\"Kartenumsatz\";\"140803816503\";\" NYX HAPPYGAMESSL \";\"-1,00\";\n";
+        let res = import_csv_into(&mut conn, acc, csv, false).unwrap();
+        assert_eq!(res.imported, 1);
+        assert_eq!(res.skipped_duplicates, 1);
     }
 
     #[test]
@@ -739,7 +1016,7 @@ mod tests {
                    2026-01-06,oops,Bad amount\n\
                    2026-01-07,-9.99,Good row\n";
 
-        let result = import_csv_into(&mut conn, acc, csv).unwrap();
+        let result = import_csv_into(&mut conn, acc, csv, false).unwrap();
         assert_eq!(result.imported, 1);
         assert_eq!(result.errors.len(), 2);
     }
@@ -748,7 +1025,7 @@ mod tests {
     fn import_requires_expected_columns() {
         let mut conn = db::open_in_memory().unwrap();
         let acc = seed_account(&conn, "Checking");
-        let err = import_csv_into(&mut conn, acc, "foo,bar\n1,2\n").unwrap_err();
+        let err = import_csv_into(&mut conn, acc, "foo,bar\n1,2\n", false).unwrap_err();
         assert!(err.contains("date"), "unexpected error: {err}");
     }
 
@@ -771,7 +1048,7 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
     fn ing_import_parses_amounts_and_stores_counterparty() {
         let mut conn = db::open_in_memory().unwrap();
         let acc = seed_account(&conn, "ING");
-        let res = import_csv_into(&mut conn, acc, ING).unwrap();
+        let res = import_csv_into(&mut conn, acc, ING, false).unwrap();
         assert_eq!(res.imported, 3);
         assert!(res.errors.is_empty(), "unexpected errors: {:?}", res.errors);
         // German amount parsed to cents; counterparty captured as the concept.
@@ -793,7 +1070,7 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         let income = cat(&conn, "Income");
         upsert_rule(&conn, "BMW Car IT GmbH", income).unwrap();
 
-        import_csv_into(&mut conn, acc, ING).unwrap();
+        import_csv_into(&mut conn, acc, ING, false).unwrap();
         // Both BMW rows are auto-categorized; the ING "Entgelt" row stays unset.
         let auto: i64 = conn
             .query_row(
@@ -870,7 +1147,7 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
     fn verified_row_survives_reimport_as_duplicate() {
         let mut conn = db::open_in_memory().unwrap();
         let acc = seed_account(&conn, "ING");
-        import_csv_into(&mut conn, acc, ING).unwrap();
+        import_csv_into(&mut conn, acc, ING, false).unwrap();
 
         // Hand-categorize and verify one row.
         let savings = cat(&conn, "Savings");
@@ -882,7 +1159,7 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         .unwrap();
 
         // Re-importing the same file changes nothing.
-        let res = import_csv_into(&mut conn, acc, ING).unwrap();
+        let res = import_csv_into(&mut conn, acc, ING, false).unwrap();
         assert_eq!(res.imported, 0);
         assert_eq!(res.skipped_duplicates, 3);
         let cat_id: Option<i64> = conn
@@ -924,6 +1201,34 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         assert_eq!(s.total_balance, 150000 - 4290 - 80000);
         assert_eq!(s.transaction_count, 3);
         assert_eq!(s.account_count, 1);
+    }
+
+    #[test]
+    fn opening_balance_folds_into_the_total_but_not_income_or_expense() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        conn.execute(
+            "UPDATE accounts SET opening_balance = 100000 WHERE id = ?1",
+            params![acc],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (account_id, date, amount) VALUES (?1, '2026-01-01', 5000)",
+            params![acc],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (account_id, date, amount) VALUES (?1, '2026-01-02', -2000)",
+            params![acc],
+        )
+        .unwrap();
+
+        let s = compute_summary(&conn).unwrap();
+        // Opening balance rides on the total...
+        assert_eq!(s.total_balance, 100000 + 5000 - 2000);
+        // ...but income and expenses only reflect the transactions.
+        assert_eq!(s.income, 5000);
+        assert_eq!(s.expenses, -2000);
     }
 
     #[test]
