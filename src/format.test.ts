@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { formatMoney, parseAmountToCents, centsToInput } from "./format";
+import {
+  formatMoney,
+  formatMoneyCompact,
+  formatMonth,
+  parseAmountToCents,
+  centsToInput,
+} from "./format";
 
 describe("parseAmountToCents", () => {
   it("parses plain decimals without float error", () => {
@@ -48,5 +54,25 @@ describe("formatMoney", () => {
     expect(formatMoney(1234)).toContain("12.34");
     expect(formatMoney(-1234)).toContain("12.34");
     expect(formatMoney(0)).toContain("0.00");
+  });
+});
+
+describe("formatMoneyCompact", () => {
+  it("abbreviates large amounts for axis labels", () => {
+    // Locale-agnostic: assert on the compacted magnitude, not the symbol.
+    expect(formatMoneyCompact(123456).toUpperCase()).toContain("1.2K");
+    expect(formatMoneyCompact(0)).toContain("0");
+  });
+});
+
+describe("formatMonth", () => {
+  it("formats a YYYY-MM key with and without the year", () => {
+    expect(formatMonth("2026-01")).toMatch(/2026/);
+    // Short form drops the year.
+    expect(formatMonth("2026-01", true)).not.toMatch(/2026/);
+  });
+
+  it("falls back to the raw key when unparseable", () => {
+    expect(formatMonth("not-a-month")).toBe("not-a-month");
   });
 });

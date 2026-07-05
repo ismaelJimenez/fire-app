@@ -97,3 +97,45 @@ pub struct Summary {
     pub account_count: i64,
     pub transaction_count: i64,
 }
+
+/// One calendar month of income/expense flow, for the Trends view.
+///
+/// Buckets are dense: every month in the requested range is present, including
+/// months with no activity (both figures 0), so a chart axis has no gaps.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct MonthlyPoint {
+    /// Calendar month as `YYYY-MM`.
+    pub month: String,
+    /// Positive-amount total for the month, in cents. Transfers excluded.
+    pub income: i64,
+    /// Negative-amount total for the month, in cents (kept negative, matching
+    /// `Summary.expenses`). Transfers excluded.
+    pub expenses: i64,
+}
+
+/// Cumulative net worth at the end of one calendar month, for the Trends view.
+///
+/// Net worth is a *stock*, not a flow: `balance` at month M is every account's
+/// opening balance plus the sum of every transaction dated on or before the last
+/// day of M — including transfers, which net to zero across the user's own
+/// accounts. Buckets are dense over the requested range. The value at the final
+/// month of an all-inclusive range equals the dashboard's total balance.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct NetWorthPoint {
+    /// Calendar month as `YYYY-MM`.
+    pub month: String,
+    /// Cumulative total balance across all accounts at month end, in cents.
+    pub balance: i64,
+}
+
+/// Total spend in one category over a period, for the Trends view's breakdown.
+///
+/// Only expenses (negative amounts) are counted and transfers are excluded;
+/// `total` is kept negative. Uncategorized spend is reported with a null id/name.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CategorySpend {
+    pub category_id: Option<i64>,
+    pub category_name: Option<String>,
+    /// Sum of negative amounts in this category over the period, in cents.
+    pub total: i64,
+}

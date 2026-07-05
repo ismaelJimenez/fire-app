@@ -49,6 +49,9 @@ pub fn run() {
             commands::list_rules,
             commands::delete_rule,
             commands::get_summary,
+            commands::monthly_series,
+            commands::networth_series,
+            commands::category_breakdown,
             commands::import_csv,
             commands::detect_bank,
         ])

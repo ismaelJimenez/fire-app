@@ -1,4 +1,4 @@
-export type View = "dashboard" | "transactions" | "import";
+export type View = "dashboard" | "trends" | "transactions" | "import";
 
 export interface Account {
   id: number;
@@ -82,4 +82,35 @@ export interface Summary {
   expenses: number;
   account_count: number;
   transaction_count: number;
+}
+
+/** One calendar month of income/expense flow for the Trends view. Buckets are
+ *  dense: every month in range is present, zero-filled where there's no data. */
+export interface MonthlyPoint {
+  /** Calendar month as `YYYY-MM`. */
+  month: string;
+  /** Positive-amount total for the month, in cents. Transfers excluded. */
+  income: number;
+  /** Negative-amount total for the month, in cents (kept negative). Transfers
+   *  excluded. */
+  expenses: number;
+}
+
+/** Cumulative net worth (a stock, not a flow) at the end of one calendar month:
+ *  opening balances plus every transaction up to month end, transfers included.
+ *  The final month of an all-time range equals the dashboard's total balance. */
+export interface NetWorthPoint {
+  /** Calendar month as `YYYY-MM`. */
+  month: string;
+  /** Cumulative total balance across all accounts at month end, in cents. */
+  balance: number;
+}
+
+/** Total spend in one category over a period (expenses only, transfers excluded).
+ *  `total` is kept negative; uncategorized spend has a null id/name. */
+export interface CategorySpend {
+  category_id: number | null;
+  category_name: string | null;
+  /** Sum of negative amounts in this category over the period, in cents. */
+  total: number;
 }

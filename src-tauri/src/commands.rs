@@ -1,6 +1,7 @@
 use crate::importers::{self, validate_date};
 use crate::models::{
-    Account, Category, ClassificationRule, ImportPreviewRow, ImportResult, Summary, Transaction,
+    Account, Category, CategorySpend, ClassificationRule, ImportPreviewRow, ImportResult,
+    MonthlyPoint, NetWorthPoint, Summary, Transaction,
 };
 use crate::AppState;
 use rusqlite::types::Value;
@@ -631,6 +632,258 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
         account_count,
         transaction_count,
     })
+}
+
+// ----------------------------------------------------------------------------
+// Trends / reports over time
+// ----------------------------------------------------------------------------
+
+/// Resolve the `from`/`to` bounds of a Trends query to concrete `YYYY-MM` months.
+///
+/// A `None` bound falls back to the earliest / latest transaction date, so an
+/// "all time" range is simply `(None, None)`. Returns `None` when there is no
+/// transaction history to anchor a timeline to.
+fn resolve_month_bounds(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> CmdResult<Option<(String, String)>> {
+    let earliest: Option<String> = conn
+        .query_row("SELECT MIN(date) FROM transactions", [], |r| r.get(0))
+        .map_err(e)?;
+    let latest: Option<String> = conn
+        .query_row("SELECT MAX(date) FROM transactions", [], |r| r.get(0))
+        .map_err(e)?;
+    let (earliest, latest) = match (earliest, latest) {
+        (Some(a), Some(b)) => (a, b),
+        // No transactions: nothing to place on a timeline.
+        _ => return Ok(None),
+    };
+    let latest_ym = latest[..7].to_string();
+    // A caller bound trumps the data bound; each is truncated to its month.
+    let from_ym = from.unwrap_or(&earliest)[..7].to_string();
+    // Never consider a month after the last transaction. Imports arrive
+    // periodically, so a preset like "year to date" whose upper bound is today
+    // would otherwise tack on empty months for the not-yet-imported part of the
+    // year — diluting per-month means and adding blank trailing buckets. Clamp
+    // the upper bound down to the last transaction's month.
+    let to_bound: &str = &to.unwrap_or(&latest)[..7];
+    let to_ym = to_bound.min(latest_ym.as_str()).to_string();
+    if from_ym > to_ym {
+        return Ok(None);
+    }
+    Ok(Some((from_ym, to_ym)))
+}
+
+/// Every `YYYY-MM` month from `from_ym` to `to_ym` inclusive, in order. Both
+/// bounds are `YYYY-MM`; the result is empty if `from_ym` is after `to_ym`.
+fn enumerate_months(from_ym: &str, to_ym: &str) -> Vec<String> {
+    let parse =
+        |ym: &str| -> (i32, i32) { (ym[..4].parse().unwrap_or(0), ym[5..7].parse().unwrap_or(1)) };
+    let (mut y, mut m) = parse(from_ym);
+    let (ey, em) = parse(to_ym);
+    let mut out = Vec::new();
+    while (y, m) <= (ey, em) {
+        out.push(format!("{y:04}-{m:02}"));
+        m += 1;
+        if m > 12 {
+            m = 1;
+            y += 1;
+        }
+    }
+    out
+}
+
+/// First/last-day string bounds for a `YYYY-MM` month, for lexical date compares.
+/// `"-01"`..`"-31"` brackets every real `YYYY-MM-DD` in the month (and only it),
+/// since ISO dates sort lexically.
+fn month_day_bounds(ym: &str) -> (String, String) {
+    (format!("{ym}-01"), format!("{ym}-31"))
+}
+
+/// Per-month income and expense totals over a period, transfers excluded.
+/// See `MonthlyPoint`. `from`/`to` are `YYYY-MM-DD`; either may be null for the
+/// full history on that side.
+#[tauri::command]
+pub fn monthly_series(
+    state: State<AppState>,
+    from: Option<String>,
+    to: Option<String>,
+) -> CmdResult<Vec<MonthlyPoint>> {
+    let conn = state.db.lock().map_err(e)?;
+    compute_monthly_series(&conn, from.as_deref(), to.as_deref())
+}
+
+fn compute_monthly_series(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> CmdResult<Vec<MonthlyPoint>> {
+    let Some((from_ym, to_ym)) = resolve_month_bounds(conn, from, to)? else {
+        return Ok(Vec::new());
+    };
+    let (lo, _) = month_day_bounds(&from_ym);
+    let (_, hi) = month_day_bounds(&to_ym);
+
+    // Sparse per-month sums (only months with activity), keyed by `YYYY-MM`.
+    let mut stmt = conn
+        .prepare(
+            "SELECT substr(date, 1, 7) AS ym,
+                    COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0)
+             FROM transactions
+             WHERE date >= ?1 AND date <= ?2
+               AND category_id IS NOT (SELECT id FROM categories WHERE is_transfer = 1)
+             GROUP BY ym",
+        )
+        .map_err(e)?;
+    let mut sparse: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    let rows = stmt
+        .query_map(params![lo, hi], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(e)?;
+    for row in rows {
+        let (ym, income, expenses) = row.map_err(e)?;
+        sparse.insert(ym, (income, expenses));
+    }
+
+    // Densify: one point per month in range, zero-filled where there's no data.
+    Ok(enumerate_months(&from_ym, &to_ym)
+        .into_iter()
+        .map(|month| {
+            let (income, expenses) = sparse.get(&month).copied().unwrap_or((0, 0));
+            MonthlyPoint {
+                month,
+                income,
+                expenses,
+            }
+        })
+        .collect())
+}
+
+/// Cumulative net worth at each month end over a period. See `NetWorthPoint`.
+#[tauri::command]
+pub fn networth_series(
+    state: State<AppState>,
+    from: Option<String>,
+    to: Option<String>,
+) -> CmdResult<Vec<NetWorthPoint>> {
+    let conn = state.db.lock().map_err(e)?;
+    compute_networth_series(&conn, from.as_deref(), to.as_deref())
+}
+
+fn compute_networth_series(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> CmdResult<Vec<NetWorthPoint>> {
+    let Some((from_ym, to_ym)) = resolve_month_bounds(conn, from, to)? else {
+        return Ok(Vec::new());
+    };
+    let (lo, _) = month_day_bounds(&from_ym);
+    let (_, hi) = month_day_bounds(&to_ym);
+
+    // Net worth is a running total, so it carries every account's opening balance
+    // and all transaction flow *before* the window as a starting level. Transfers
+    // are included: they net to zero across the user's own accounts.
+    let opening: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(opening_balance), 0) FROM accounts",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(e)?;
+    let before_window: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE date < ?1",
+            params![lo],
+            |r| r.get(0),
+        )
+        .map_err(e)?;
+
+    // Sparse net flow (all transactions, transfers included) per month in window.
+    let mut stmt = conn
+        .prepare(
+            "SELECT substr(date, 1, 7) AS ym, COALESCE(SUM(amount), 0)
+             FROM transactions
+             WHERE date >= ?1 AND date <= ?2
+             GROUP BY ym",
+        )
+        .map_err(e)?;
+    let mut flows: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let rows = stmt
+        .query_map(params![lo, hi], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map_err(e)?;
+    for row in rows {
+        let (ym, flow) = row.map_err(e)?;
+        flows.insert(ym, flow);
+    }
+
+    let mut running = opening + before_window;
+    Ok(enumerate_months(&from_ym, &to_ym)
+        .into_iter()
+        .map(|month| {
+            running += flows.get(&month).copied().unwrap_or(0);
+            NetWorthPoint {
+                month,
+                balance: running,
+            }
+        })
+        .collect())
+}
+
+/// Spend per category over a period, biggest spend first. See `CategorySpend`.
+#[tauri::command]
+pub fn category_breakdown(
+    state: State<AppState>,
+    from: Option<String>,
+    to: Option<String>,
+) -> CmdResult<Vec<CategorySpend>> {
+    let conn = state.db.lock().map_err(e)?;
+    compute_category_breakdown(&conn, from.as_deref(), to.as_deref())
+}
+
+fn compute_category_breakdown(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> CmdResult<Vec<CategorySpend>> {
+    let Some((from_ym, to_ym)) = resolve_month_bounds(conn, from, to)? else {
+        return Ok(Vec::new());
+    };
+    let (lo, _) = month_day_bounds(&from_ym);
+    let (_, hi) = month_day_bounds(&to_ym);
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.category_id, c.name, SUM(t.amount) AS total
+             FROM transactions t
+             LEFT JOIN categories c ON c.id = t.category_id
+             WHERE t.amount < 0
+               AND t.date >= ?1 AND t.date <= ?2
+               AND t.category_id IS NOT (SELECT id FROM categories WHERE is_transfer = 1)
+             GROUP BY t.category_id
+             ORDER BY total ASC",
+        )
+        .map_err(e)?;
+    let rows = stmt
+        .query_map(params![lo, hi], |r| {
+            Ok(CategorySpend {
+                category_id: r.get(0)?,
+                category_name: r.get(1)?,
+                total: r.get(2)?,
+            })
+        })
+        .map_err(e)?;
+    rows.map(|r| r.map_err(e)).collect()
 }
 
 // ----------------------------------------------------------------------------
@@ -1484,5 +1737,229 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
             query_transactions(&conn, None, None, None).unwrap().len(),
             5
         );
+    }
+
+    // --- Trends: monthly / net worth / category series -----------------------
+
+    /// Insert a transaction on a given ISO date, optionally in a category.
+    fn seed_dated_tx(
+        conn: &Connection,
+        account_id: i64,
+        date: &str,
+        amount: i64,
+        cat: Option<i64>,
+    ) {
+        conn.execute(
+            "INSERT INTO transactions (account_id, date, amount, category_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![account_id, date, amount, cat],
+        )
+        .unwrap();
+    }
+
+    fn transfer_cat(conn: &Connection) -> i64 {
+        conn.query_row("SELECT id FROM categories WHERE is_transfer = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn enumerate_months_is_dense_and_crosses_year_boundaries() {
+        assert_eq!(enumerate_months("2026-03", "2026-03"), vec!["2026-03"]);
+        assert_eq!(
+            enumerate_months("2025-11", "2026-02"),
+            vec!["2025-11", "2025-12", "2026-01", "2026-02"]
+        );
+        // A backwards range yields nothing.
+        assert!(enumerate_months("2026-05", "2026-01").is_empty());
+    }
+
+    #[test]
+    fn monthly_series_zero_fills_gaps_and_excludes_transfers() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let xfer = transfer_cat(&conn);
+        seed_dated_tx(&conn, acc, "2026-01-10", 300000, None); // income
+        seed_dated_tx(&conn, acc, "2026-01-15", -50000, None); // expense
+        seed_dated_tx(&conn, acc, "2026-01-20", -80000, Some(xfer)); // transfer, ignored
+                                                                     // Nothing at all in February.
+        seed_dated_tx(&conn, acc, "2026-03-05", -20000, None); // expense
+
+        let series = compute_monthly_series(&conn, None, None).unwrap();
+        assert_eq!(
+            series,
+            vec![
+                MonthlyPoint {
+                    month: "2026-01".into(),
+                    income: 300000,
+                    expenses: -50000,
+                },
+                MonthlyPoint {
+                    month: "2026-02".into(),
+                    income: 0,
+                    expenses: 0,
+                },
+                MonthlyPoint {
+                    month: "2026-03".into(),
+                    income: 0,
+                    expenses: -20000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn monthly_series_respects_explicit_from_to_window() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        seed_dated_tx(&conn, acc, "2025-12-31", 111, None); // before window
+        seed_dated_tx(&conn, acc, "2026-02-14", 5000, None); // in window
+        seed_dated_tx(&conn, acc, "2026-04-01", 999, None); // after window
+
+        let series = compute_monthly_series(&conn, Some("2026-01-01"), Some("2026-03-31")).unwrap();
+        let months: Vec<_> = series.iter().map(|p| p.month.as_str()).collect();
+        assert_eq!(months, vec!["2026-01", "2026-02", "2026-03"]);
+        assert_eq!(series[1].income, 5000);
+        assert_eq!(series.iter().map(|p| p.income).sum::<i64>(), 5000);
+    }
+
+    #[test]
+    fn series_never_extend_past_the_last_transaction() {
+        // Last import is June; asking for a range that runs into July (as the YTD
+        // preset does when "today" is in July) must stop at June so empty trailing
+        // months don't dilute per-month means.
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        seed_dated_tx(&conn, acc, "2026-05-10", 30000, None);
+        seed_dated_tx(&conn, acc, "2026-06-10", -10000, None);
+
+        let monthly =
+            compute_monthly_series(&conn, Some("2026-01-01"), Some("2026-07-31")).unwrap();
+        let months: Vec<_> = monthly.iter().map(|p| p.month.as_str()).collect();
+        assert_eq!(
+            months,
+            vec!["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"]
+        );
+        assert_eq!(monthly.last().unwrap().month, "2026-06");
+
+        // Net worth and category series share the same clamped window.
+        let networth =
+            compute_networth_series(&conn, Some("2026-01-01"), Some("2026-07-31")).unwrap();
+        assert_eq!(networth.last().unwrap().month, "2026-06");
+    }
+
+    #[test]
+    fn monthly_series_is_empty_without_transactions() {
+        let conn = db::open_in_memory().unwrap();
+        seed_account(&conn, "Checking");
+        assert!(compute_monthly_series(&conn, None, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn networth_series_accumulates_opening_balance_and_transfers() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        conn.execute(
+            "UPDATE accounts SET opening_balance = 100000 WHERE id = ?1",
+            params![acc],
+        )
+        .unwrap();
+        let xfer = transfer_cat(&conn);
+        seed_dated_tx(&conn, acc, "2026-01-10", 50000, None);
+        seed_dated_tx(&conn, acc, "2026-02-10", -20000, Some(xfer)); // transfer still moves balance
+                                                                     // March: no activity, net worth holds flat.
+        seed_dated_tx(&conn, acc, "2026-04-10", 5000, None);
+
+        let series = compute_networth_series(&conn, None, None).unwrap();
+        assert_eq!(
+            series,
+            vec![
+                NetWorthPoint {
+                    month: "2026-01".into(),
+                    balance: 150000, // 100000 opening + 50000
+                },
+                NetWorthPoint {
+                    month: "2026-02".into(),
+                    balance: 130000, // - 20000 transfer
+                },
+                NetWorthPoint {
+                    month: "2026-03".into(),
+                    balance: 130000, // flat
+                },
+                NetWorthPoint {
+                    month: "2026-04".into(),
+                    balance: 135000, // + 5000
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn networth_last_point_reconciles_with_dashboard_total() {
+        // FR-35: the latest net-worth point over an all-inclusive range must equal
+        // the dashboard's total balance for the same data.
+        let conn = db::open_in_memory().unwrap();
+        let a = seed_account(&conn, "Checking");
+        let b = seed_account(&conn, "Savings");
+        conn.execute(
+            "UPDATE accounts SET opening_balance = 25000 WHERE id = ?1",
+            params![b],
+        )
+        .unwrap();
+        let xfer = transfer_cat(&conn);
+        seed_dated_tx(&conn, a, "2024-06-01", 400000, None);
+        seed_dated_tx(&conn, a, "2025-03-15", -120000, None);
+        seed_dated_tx(&conn, a, "2025-03-16", -30000, Some(xfer)); // move to savings
+        seed_dated_tx(&conn, b, "2025-03-16", 30000, Some(xfer));
+        seed_dated_tx(&conn, b, "2026-01-02", 15000, None);
+
+        let series = compute_networth_series(&conn, None, None).unwrap();
+        let last = series.last().unwrap().balance;
+        let total = compute_summary(&conn).unwrap().total_balance;
+        assert_eq!(last, total);
+    }
+
+    #[test]
+    fn networth_window_carries_pre_window_history_as_a_baseline() {
+        // A window that starts after history begins still reflects the true stock:
+        // the first shown month includes everything that came before it.
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        seed_dated_tx(&conn, acc, "2025-01-01", 200000, None); // long before window
+        seed_dated_tx(&conn, acc, "2026-02-01", 10000, None); // in window
+
+        let series =
+            compute_networth_series(&conn, Some("2026-01-01"), Some("2026-02-28")).unwrap();
+        assert_eq!(series[0].balance, 200000); // Jan carries the prior 200000
+        assert_eq!(series[1].balance, 210000); // Feb adds 10000
+    }
+
+    #[test]
+    fn category_breakdown_ranks_spend_and_excludes_income_and_transfers() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let groceries = cat(&conn, "Groceries");
+        let rent = cat(&conn, "Rent");
+        let xfer = transfer_cat(&conn);
+        seed_dated_tx(&conn, acc, "2026-01-05", -20000, Some(groceries));
+        seed_dated_tx(&conn, acc, "2026-01-06", -15000, Some(groceries));
+        seed_dated_tx(&conn, acc, "2026-01-07", -90000, Some(rent));
+        seed_dated_tx(&conn, acc, "2026-01-08", -5000, None); // uncategorized expense
+        seed_dated_tx(&conn, acc, "2026-01-09", 300000, Some(groceries)); // income, ignored
+        seed_dated_tx(&conn, acc, "2026-01-10", -70000, Some(xfer)); // transfer, ignored
+
+        let rows = compute_category_breakdown(&conn, None, None).unwrap();
+        // Ordered by biggest spend (most negative) first.
+        assert_eq!(rows[0].category_name.as_deref(), Some("Rent"));
+        assert_eq!(rows[0].total, -90000);
+        assert_eq!(rows[1].category_name.as_deref(), Some("Groceries"));
+        assert_eq!(rows[1].total, -35000);
+        // Uncategorized spend is reported with null id/name.
+        assert_eq!(rows[2].category_id, None);
+        assert_eq!(rows[2].total, -5000);
+        assert_eq!(rows.len(), 3);
     }
 }

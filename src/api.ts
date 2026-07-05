@@ -2,8 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
   Category,
+  CategorySpend,
   ClassificationRule,
   ImportResult,
+  MonthlyPoint,
+  NetWorthPoint,
   Summary,
   Transaction,
 } from "./types";
@@ -85,6 +88,15 @@ export const deleteRule = (id: number) => invoke<void>("delete_rule", { id });
 
 // Summary + import
 export const getSummary = () => invoke<Summary>("get_summary");
+
+// Trends (reports over time). `from`/`to` are ISO `YYYY-MM-DD` bounds, inclusive;
+// pass null on either side for the full history on that side (all-time = both null).
+export const monthlySeries = (from: string | null, to: string | null) =>
+  invoke<MonthlyPoint[]>("monthly_series", { from, to });
+export const networthSeries = (from: string | null, to: string | null) =>
+  invoke<NetWorthPoint[]>("networth_series", { from, to });
+export const categoryBreakdown = (from: string | null, to: string | null) =>
+  invoke<CategorySpend[]>("category_breakdown", { from, to });
 export const importCsv = (accountId: number, csvText: string, dryRun = false) =>
   invoke<ImportResult>("import_csv", { accountId, csvText, dryRun });
 export const detectBank = (csvText: string) =>

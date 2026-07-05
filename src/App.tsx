@@ -2,6 +2,7 @@ import { useState } from "react";
 import { StoreProvider, useStore } from "./store";
 import { Sidebar } from "./components/Sidebar";
 import { Dashboard } from "./components/Dashboard";
+import { Trends } from "./components/Trends";
 import { Transactions } from "./components/Transactions";
 import { Import } from "./components/Import";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -44,6 +45,7 @@ function Shell() {
       />
       <main className="main">
         {view === "dashboard" && <Dashboard onNavigate={navigate} />}
+        {view === "trends" && <Trends onNavigate={navigate} />}
         {view === "transactions" && (
           <Transactions
             accountId={accountId}

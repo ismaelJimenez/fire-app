@@ -11,6 +11,18 @@ export function formatMoney(cents: number): string {
   return currencyFmt.format(cents / 100);
 }
 
+const compactFmt = new Intl.NumberFormat(undefined, {
+  style: "currency",
+  currency: "EUR",
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+/** Format cents compactly for chart axes, e.g. 123456 -> "€1.2K". */
+export function formatMoneyCompact(cents: number): string {
+  return compactFmt.format(cents / 100);
+}
+
 /**
  * Parse a user-entered decimal string into integer cents.
  *
@@ -67,4 +79,18 @@ export function formatDate(iso: string): string {
 
 export function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+const monthFmt = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  year: "numeric",
+});
+const monthShortFmt = new Intl.DateTimeFormat(undefined, { month: "short" });
+
+/** Format a `YYYY-MM` month key, e.g. "2026-01" -> "Jan 2026" (or "Jan" when
+ *  `short`). Falls back to the raw key if it can't be parsed. */
+export function formatMonth(ym: string, short = false): string {
+  const d = new Date(ym + "-01T00:00:00");
+  if (Number.isNaN(d.getTime())) return ym;
+  return (short ? monthShortFmt : monthFmt).format(d);
 }

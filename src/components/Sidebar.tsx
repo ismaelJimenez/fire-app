@@ -138,6 +138,7 @@ export function Sidebar({ view, onNavigate, selectedAccountId }: Props) {
 
   const navItems: { id: View; icon: string; label: string }[] = [
     { id: "dashboard", icon: "◧", label: "Dashboard" },
+    { id: "trends", icon: "📈", label: "Trends" },
     { id: "transactions", icon: "≡", label: "Transactions" },
     { id: "import", icon: "↑", label: "Import CSV" },
   ];

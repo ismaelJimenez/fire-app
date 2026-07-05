@@ -743,3 +743,178 @@ tr:hover .row-actions {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
+
+/* ------------------------------ Trends ------------------------------ */
+
+/* Segmented time-range control in the page head. */
+.seg-control {
+  display: inline-flex;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px;
+  gap: 2px;
+}
+.seg {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.seg:hover {
+  color: var(--text);
+}
+.seg.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.chart-card {
+  padding: 16px 18px 10px;
+}
+.chart {
+  position: relative;
+}
+.chart-plot {
+  position: relative;
+}
+.chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.chart-svg .axis-line {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.chart-svg .axis-text {
+  fill: var(--text-faint);
+  font-size: 11px;
+}
+.chart-svg .crosshair {
+  stroke: var(--text-faint);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+/* Faint magnitude reference in the plot corners. */
+.axis-tag {
+  position: absolute;
+  left: 2px;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.axis-tag.top {
+  top: 2px;
+}
+.axis-tag.bot {
+  bottom: 26px;
+}
+
+.chart-legend {
+  display: flex;
+  gap: 16px;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+.chart-legend .lg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.chart-legend .sw {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+
+/* Floating tooltip anchored to a hovered mark; centered on its x. */
+.chart-tooltip {
+  position: absolute;
+  top: 6px;
+  transform: translateX(-50%);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 8px 10px;
+  font-size: 12.5px;
+  min-width: 140px;
+  pointer-events: none;
+  z-index: 5;
+}
+.chart-tooltip strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.chart-tooltip .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.chart-tooltip .row span {
+  color: var(--text);
+  font-weight: 600;
+}
+.chart-tooltip .row.pos span {
+  color: var(--positive);
+}
+.chart-tooltip .row.neg span {
+  color: var(--negative);
+}
+
+/* Ranked category spend bars (plain HTML). */
+.cat-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px;
+}
+.cat-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 40px auto;
+  align-items: center;
+  gap: 12px;
+}
+.cat-pct {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  text-align: right;
+}
+.cat-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cat-track {
+  background: var(--surface-2);
+  border-radius: 5px;
+  height: 14px;
+  overflow: hidden;
+}
+.cat-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 5px;
+  min-width: 2px;
+}
+.cat-value {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  text-align: right;
+}

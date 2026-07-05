@@ -895,8 +895,8 @@ mod tests {
         // Ambiguous slash dates are always read day-first, never month-first, so a
         // file can't be interpreted inconsistently row to row.
         assert_eq!(normalize_date("03/04/2026").unwrap(), "2026-04-03"); // 3 April, not 4 March
-        // A genuinely month-first date is a bad row, not a silent misparse: "13" is
-        // not a valid month under the day-first layout, so it fails loudly.
+                                                                         // A genuinely month-first date is a bad row, not a silent misparse: "13" is
+                                                                         // not a valid month under the day-first layout, so it fails loudly.
         assert!(normalize_date("04/13/2026").is_err());
     }
 
