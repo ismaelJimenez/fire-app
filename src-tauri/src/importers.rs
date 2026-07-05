@@ -39,8 +39,14 @@ pub(crate) enum BankFormat {
     Canonical,
     /// ING-DiBa Girokonto "Umsatzanzeige" export.
     IngDiba,
+    /// ING España "Movimientos de la Cuenta" export.
+    IngEs,
     /// comdirect account "Umsätze" export.
     Comdirect,
+    /// Deutsche Bank / maxblue account "Umsätze" export.
+    DeutscheBank,
+    /// DEGIRO (Spanish) cash-account "Account.csv" export.
+    Degiro,
 }
 
 impl BankFormat {
@@ -49,7 +55,10 @@ impl BankFormat {
         match self {
             BankFormat::Canonical => "Canonical template",
             BankFormat::IngDiba => "ING-DiBa",
+            BankFormat::IngEs => "ING España",
             BankFormat::Comdirect => "comdirect",
+            BankFormat::DeutscheBank => "Deutsche Bank",
+            BankFormat::Degiro => "DEGIRO",
         }
     }
 }
@@ -62,9 +71,24 @@ pub(crate) fn detect_format(text: &str) -> BankFormat {
         if t.starts_with("Buchung;Wertstellungsdatum") || t.starts_with("Umsatzanzeige;") {
             return BankFormat::IngDiba;
         }
+        // ING España's `,`-delimited data header. (Its banner line carries a UTF-8
+        // BOM that `trim` doesn't strip, so we key off the clean data header.)
+        if t.starts_with("F. VALOR,") {
+            return BankFormat::IngEs;
+        }
         // comdirect's quoted data header, or its "Umsätze <Konto>" banner.
         if t.starts_with("\"Buchungstag\"") || t.starts_with("\"Umsätze") {
             return BankFormat::Comdirect;
+        }
+        // Deutsche Bank / maxblue's unquoted data header. (comdirect quotes the same
+        // leading column, so the quote check above wins for those files.)
+        if t.starts_with("Buchungstag;Wert;Umsatzart") {
+            return BankFormat::DeutscheBank;
+        }
+        // DEGIRO's Spanish cash-account data header. The amount and balance columns
+        // carry no name, so key off the fixed leading columns.
+        if t.starts_with("Fecha,Hora,Fecha valor") {
+            return BankFormat::Degiro;
         }
     }
     BankFormat::Canonical
@@ -79,7 +103,10 @@ pub(crate) fn detect_format(text: &str) -> BankFormat {
 pub(crate) fn parse(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
     match detect_format(text) {
         BankFormat::IngDiba => parse_ing(text),
+        BankFormat::IngEs => parse_ing_es(text),
         BankFormat::Comdirect => parse_comdirect(text),
+        BankFormat::DeutscheBank => parse_db(text),
+        BankFormat::Degiro => parse_degiro(text),
         BankFormat::Canonical => parse_canonical(text),
     }
 }
@@ -223,6 +250,183 @@ fn parse_ing(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
             category: None,
             // The ING Girokonto export has no dedicated reference column; its
             // Verwendungszweck already distinguishes otherwise-identical rows.
+            import_ref: String::new(),
+        });
+    }
+    Ok((rows, errors))
+}
+
+// ----------------------------------------------------------------------------
+// ING España
+// ----------------------------------------------------------------------------
+
+/// ING España "Movimientos de la Cuenta": `,`-delimited, US-style numbers (`.`
+/// decimal, e.g. `-14.52`) and mixed dates (`14/04/2026` alongside the short
+/// `4/6/26`), preceded by a metadata preamble (account number, holder, export
+/// date). Unlike the German ING-DiBa export there is no counterparty column, so the
+/// free-text `DESCRIPCIÓN` drives both the description and the classification
+/// concept. The file also carries ING's own `CATEGORÍA`, but we leave the app's
+/// category unset and rely on learned rules, mirroring the other bank importers.
+fn parse_ing_es(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
+    // The data table starts at the "F. VALOR,CATEGORÍA,…" header; everything above
+    // it is account metadata (banner, account number, holder, export date).
+    let header_pos = text
+        .lines()
+        .position(|l| l.trim().starts_with("F. VALOR,"))
+        .ok_or("Could not find the ING España transaction table header")?;
+    let data: String = text.lines().skip(header_pos).collect::<Vec<_>>().join("\n");
+
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(data.as_bytes());
+
+    let headers = reader.headers().map_err(|e| e.to_string())?.clone();
+    let idx = |name: &str| headers.iter().position(|h| h.eq_ignore_ascii_case(name));
+    let date_i = idx("F. VALOR").ok_or("ING España CSV is missing the 'F. VALOR' column")?;
+    let amount_i =
+        idx("IMPORTE (€)").ok_or("ING España CSV is missing the 'IMPORTE (€)' column")?;
+    let desc_i = idx("DESCRIPCIÓN").ok_or("ING España CSV is missing the 'DESCRIPCIÓN' column")?;
+
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for (n, record) in reader.records().enumerate() {
+        let line = n + 2;
+        let record = match record {
+            Ok(r) => r,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        let date = match normalize_es_date(record.get(date_i).unwrap_or("").trim()) {
+            Ok(d) => d,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+        // Amounts use a `.` decimal separator, like the canonical template.
+        let amount_cents = match parse_amount_cents(record.get(amount_i).unwrap_or("").trim()) {
+            Ok(a) => a,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        let description = normalize_concept(record.get(desc_i).unwrap_or("").trim());
+
+        rows.push(ParsedRow {
+            date,
+            amount_cents,
+            // No dedicated counterparty column; the free-text description is the best
+            // available classification concept.
+            counterparty: description.clone(),
+            description,
+            category: None,
+            // No per-transaction reference in the export; fall back to
+            // date+amount+description for dedup, as the German ING importer does.
+            import_ref: String::new(),
+        });
+    }
+    Ok((rows, errors))
+}
+
+// ----------------------------------------------------------------------------
+// DEGIRO (Spanish cash account)
+// ----------------------------------------------------------------------------
+
+/// DEGIRO's Spanish "Account.csv" cash statement: `,`-delimited, European numbers
+/// (`"-51,18"` — comma decimal, quoted) and `DD-MM-YYYY` dates. Two columns carry no
+/// header name: the amount is the field right after `Variación` (which holds the
+/// amount's currency), and the running balance the field after `Saldo`. We read those
+/// positionally rather than by name.
+///
+/// The account is EUR-denominated, but the file also lists USD sub-ledger movements
+/// (dividends, corporate-action fees, and the USD leg of each currency conversion).
+/// The single-currency model can't represent those, so we import only EUR rows — the
+/// EUR a dividend ultimately lands as still appears via its "Ingreso Cambio de Divisa"
+/// row. Internal cash-sweep mirror legs ("Transferir … flatexDEGIRO Bank") carry no
+/// amount and are skipped. There is no counterparty column, so the free-text
+/// `Descripción` drives both the description and the classification concept, as in the
+/// ING España importer.
+fn parse_degiro(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
+    // The data table starts at the "Fecha,Hora,Fecha valor,…" header; DEGIRO exports
+    // have no preamble, but locate it defensively like the other importers.
+    let header_pos = text
+        .lines()
+        .position(|l| l.trim().starts_with("Fecha,Hora,Fecha valor"))
+        .ok_or("Could not find the DEGIRO transaction table header")?;
+    let data: String = text.lines().skip(header_pos).collect::<Vec<_>>().join("\n");
+
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(data.as_bytes());
+
+    // The column layout is fixed and partly unnamed, so index positionally. The
+    // amount's currency sits in `Variación` (7); the amount itself is the unnamed
+    // field right after it (8).
+    const DATE_I: usize = 0;
+    const DESC_I: usize = 5;
+    const CURRENCY_I: usize = 7;
+    const AMOUNT_I: usize = 8;
+
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for (n, record) in reader.records().enumerate() {
+        let line = n + 2;
+        let record = match record {
+            Ok(r) => r,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        // A row with no amount is an internal cash-sweep mirror leg ("Transferir …
+        // flatexDEGIRO Bank"), not a transaction of its own. Skip it silently.
+        let raw_amount = record.get(AMOUNT_I).map(str::trim).unwrap_or("");
+        if raw_amount.is_empty() {
+            continue;
+        }
+
+        // Only EUR rows are representable in the single-currency ledger; skip USD (and
+        // any other) sub-ledger movements silently rather than mis-book them as euros.
+        let currency = record.get(CURRENCY_I).map(str::trim).unwrap_or("");
+        if !currency.eq_ignore_ascii_case("EUR") {
+            continue;
+        }
+
+        let date = match normalize_date(record.get(DATE_I).unwrap_or("").trim()) {
+            Ok(d) => d,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+        let amount_cents = match parse_de_amount_cents(raw_amount) {
+            Ok(a) => a,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        let description = normalize_concept(record.get(DESC_I).unwrap_or("").trim());
+
+        rows.push(ParsedRow {
+            date,
+            amount_cents,
+            // No counterparty column; the free-text description is the best available
+            // classification concept, mirroring the ING España importer.
+            counterparty: description.clone(),
+            description,
+            category: None,
+            // "ID Orden" is populated only for trades (empty for these cash
+            // movements); fall back to date+amount+description for dedup.
             import_ref: String::new(),
         });
     }
@@ -382,6 +586,101 @@ fn comdirect_counterparty(buchungstext: &str, vorgang: &str) -> String {
 }
 
 // ----------------------------------------------------------------------------
+// Deutsche Bank / maxblue
+// ----------------------------------------------------------------------------
+
+/// Deutsche Bank (and maxblue) account "Umsätze" export: `;`-delimited, unquoted,
+/// German numbers (`-134,87`) and dates (`15.6.2026`, unpadded), preceded by a
+/// metadata preamble (banner, IBAN, opening balance) and closed by a `Kontostand`
+/// balance trailer. The `Betrag` column already carries the sign, so we read it
+/// directly rather than the split `Soll`/`Haben` columns. The counterparty comes
+/// from `Begünstigter / Auftraggeber`; depot bookings (dividends, fees) leave that
+/// empty, so we fall back to the transaction type (`Umsatzart`) for a stable
+/// classification key, mirroring the comdirect `Vorgang` fallback.
+fn parse_db(text: &str) -> Result<(Vec<ParsedRow>, Vec<String>), String> {
+    // The data table starts at the "Buchungstag;Wert;Umsatzart;…" header; everything
+    // above it is account metadata (banner, IBAN, opening balance).
+    let header_pos = text
+        .lines()
+        .position(|l| l.trim().starts_with("Buchungstag;Wert;Umsatzart"))
+        .ok_or("Could not find the Deutsche Bank transaction table header")?;
+    let data: String = text.lines().skip(header_pos).collect::<Vec<_>>().join("\n");
+
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b';')
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(data.as_bytes());
+
+    let headers = reader.headers().map_err(|e| e.to_string())?.clone();
+    let idx = |name: &str| headers.iter().position(|h| h.eq_ignore_ascii_case(name));
+    let date_i =
+        idx("Buchungstag").ok_or("Deutsche Bank CSV is missing the 'Buchungstag' column")?;
+    let amount_i = idx("Betrag").ok_or("Deutsche Bank CSV is missing the 'Betrag' column")?;
+    let payee_i = idx("Begünstigter / Auftraggeber");
+    let type_i = idx("Umsatzart");
+    let purpose_i = idx("Verwendungszweck");
+
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for (n, record) in reader.records().enumerate() {
+        let line = n + 2;
+        let record = match record {
+            Ok(r) => r,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        // Deutsche Bank closes the table with a "Kontostand" (closing balance)
+        // trailer row; it isn't a transaction, so skip it rather than report it.
+        if record.get(date_i).map(str::trim) == Some("Kontostand") {
+            continue;
+        }
+
+        let date = match normalize_date(record.get(date_i).unwrap_or("").trim()) {
+            Ok(d) => d,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+        let amount_cents = match parse_de_amount_cents(record.get(amount_i).unwrap_or("").trim()) {
+            Ok(a) => a,
+            Err(err) => {
+                errors.push(format!("Row {line}: {err}"));
+                continue;
+            }
+        };
+
+        let payee = payee_i.and_then(|i| record.get(i)).unwrap_or("").trim();
+        let counterparty = if payee.is_empty() {
+            normalize_concept(type_i.and_then(|i| record.get(i)).unwrap_or("").trim())
+        } else {
+            normalize_concept(payee)
+        };
+        let description =
+            normalize_concept(purpose_i.and_then(|i| record.get(i)).unwrap_or("").trim());
+
+        rows.push(ParsedRow {
+            date,
+            amount_cents,
+            counterparty,
+            description,
+            category: None,
+            // Deutsche Bank's "Kundenreferenz" is NOT a reliable per-transaction
+            // identity — it's routinely a shared placeholder ("NOTPROVIDED"/"NONREF")
+            // or a batch reference repeated across unrelated rows, so using it as the
+            // dedup key collapses genuinely distinct transactions. Leave it empty and
+            // fall back to date+amount+description, as the ING importer does.
+            import_ref: String::new(),
+        });
+    }
+    Ok((rows, errors))
+}
+
+// ----------------------------------------------------------------------------
 // Shared parsing helpers
 // ----------------------------------------------------------------------------
 
@@ -429,6 +728,21 @@ pub(crate) fn normalize_date(raw: &str) -> Result<String, String> {
         }
     }
     Err(format!("Invalid date \"{raw}\" (expected YYYY-MM-DD)"))
+}
+
+/// Normalize an ING España date, which mixes full `DD/MM/YYYY` (`14/04/2026`) with a
+/// short `D/M/YY` (`4/6/26`) in the same file. We can't route these through
+/// [`normalize_date`]: its `%d/%m/%Y` pass would happily read the 2-digit "26" as the
+/// year 26 AD. Instead we pick the year width from the third field so "26" is
+/// interpreted as 2026.
+fn normalize_es_date(raw: &str) -> Result<String, String> {
+    let fmt = match raw.rsplit('/').next() {
+        Some(year) if year.len() <= 2 => "%d/%m/%y",
+        _ => "%d/%m/%Y",
+    };
+    NaiveDate::parse_from_str(raw, fmt)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .map_err(|_| format!("Invalid date \"{raw}\" (expected DD/MM/YYYY)"))
 }
 
 /// Parse a decimal amount that uses a `.` decimal separator (the canonical format)
@@ -652,6 +966,132 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         assert!(err.contains("header"), "unexpected error: {err}");
     }
 
+    // --- ING España parsing --------------------------------------------------
+
+    // A Spanish ING export: a UTF-8 BOM on the banner, a metadata preamble, the
+    // `,`-delimited `F. VALOR,…` data header, US-style amounts, and dates that mix
+    // full `DD/MM/YYYY` with the short `D/M/YY`. The SALDO balance column carries
+    // quoted thousands separators we ignore.
+    const ING_ES_SAMPLE: &str = "\u{feff}Movimientos de la Cuenta,,  Número de cuenta:,1465 0100 9617 08810024,,,\n\
+,,  Titular:,ISMAEL JIMENEZ MARTINEZ,,,\n\
+,,  Fecha exportación:,05/07/2026 10:55h,,,\n\
+F. VALOR,CATEGORÍA,SUBCATEGORÍA,DESCRIPCIÓN,COMENTARIO,IMPORTE (€),SALDO (€)\n\
+4/6/26,Otros gastos,Comisiones e intereses,Comisión de mantenimiento de cuenta,,-3,\"1,158.89\"\n\
+14/04/2026,Otros gastos,Comisiones e intereses,Comisión de custodia,,-14.52,\"1,164.89\"\n\
+7/4/26,Inversión,Acciones,Abono por evento DIVIDENDO (VANGUARD S&P 500 UCITS ETF),,28.6,\"1,179.41\"\n";
+
+    #[test]
+    fn detects_ing_es() {
+        assert_eq!(detect_format(ING_ES_SAMPLE), BankFormat::IngEs);
+    }
+
+    #[test]
+    fn parses_ing_es_export() {
+        let (rows, errors) = parse(ING_ES_SAMPLE).unwrap();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(rows.len(), 3);
+
+        // Short D/M/YY date; US-style negative amount; DESCRIPCIÓN drives both the
+        // description and the classification concept. Category is left unset.
+        assert_eq!(
+            rows[0],
+            ParsedRow {
+                date: "2026-06-04".into(),
+                amount_cents: -300,
+                counterparty: "Comisión de mantenimiento de cuenta".into(),
+                description: "Comisión de mantenimiento de cuenta".into(),
+                category: None,
+                import_ref: String::new(),
+            }
+        );
+
+        // Full DD/MM/YYYY date parses too.
+        assert_eq!(rows[1].date, "2026-04-14");
+        assert_eq!(rows[1].amount_cents, -1452);
+
+        // A positive amount (dividend) is income; fractional dot decimal handled.
+        assert_eq!(rows[2].date, "2026-04-07");
+        assert_eq!(rows[2].amount_cents, 2860);
+        assert_eq!(
+            rows[2].counterparty,
+            "Abono por evento DIVIDENDO (VANGUARD S&P 500 UCITS ETF)"
+        );
+    }
+
+    #[test]
+    fn ing_es_short_and_full_years() {
+        assert_eq!(normalize_es_date("4/6/26").unwrap(), "2026-06-04");
+        assert_eq!(normalize_es_date("14/04/2026").unwrap(), "2026-04-14");
+        assert_eq!(normalize_es_date("7/4/26").unwrap(), "2026-04-07");
+        assert!(normalize_es_date("not-a-date").is_err());
+    }
+
+    // --- DEGIRO parsing ------------------------------------------------------
+
+    // A DEGIRO Spanish cash export: no preamble, a `,`-delimited header whose amount
+    // and balance columns are unnamed, `DD-MM-YYYY` dates, quoted comma-decimal
+    // amounts, an empty-amount "Transferir" mirror leg, and USD sub-ledger rows
+    // (dividend, corporate-action fee, FX withdrawal leg) that must be skipped.
+    const DEGIRO_SAMPLE: &str = "\
+Fecha,Hora,Fecha valor,Producto,ISIN,Descripción,Tipo,Variación,,Saldo,,ID Orden\n\
+05-04-2026,22:30,31-03-2026,,,Flatex Interest Income,,EUR,\"0,00\",EUR,\"468,04\",\n\
+03-04-2026,10:48,03-04-2026,,,Degiro Cash Sweep Transfer,,EUR,\"-51,18\",EUR,\"468,04\",\n\
+03-04-2026,10:48,03-04-2026,,,\"Transferir a su Cuenta de Efectivo en flatexDEGIRO Bank: 51,18 EUR\",,,,EUR,\"519,22\",\n\
+03-04-2026,07:18,02-04-2026,,,Ingreso Cambio de Divisa,,EUR,\"51,18\",EUR,\"468,04\",\n\
+03-04-2026,07:18,02-04-2026,,,Retirada Cambio de Divisa,\"1,1568\",USD,\"-59,21\",USD,\"0,00\",\n\
+02-04-2026,07:41,01-04-2026,VANGUARD FTSE ALL-WORLD UCITS ETF,IE00B3RBWM25,Dividendo,,USD,\"62,24\",USD,\"62,24\",\n";
+
+    #[test]
+    fn detects_degiro() {
+        assert_eq!(detect_format(DEGIRO_SAMPLE), BankFormat::Degiro);
+    }
+
+    #[test]
+    fn parses_degiro_export() {
+        let (rows, errors) = parse(DEGIRO_SAMPLE).unwrap();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        // Only the three EUR rows survive: the two USD rows and the empty-amount
+        // "Transferir" mirror leg are skipped (not reported as errors).
+        assert_eq!(rows.len(), 3);
+
+        // Positional amount (field after Variación); DD-MM-YYYY date; comma decimal.
+        // Descripción drives both description and the classification concept.
+        assert_eq!(
+            rows[0],
+            ParsedRow {
+                date: "2026-04-05".into(),
+                amount_cents: 0,
+                counterparty: "Flatex Interest Income".into(),
+                description: "Flatex Interest Income".into(),
+                category: None,
+                import_ref: String::new(),
+            }
+        );
+
+        // A negative cash-sweep amount is an expense.
+        assert_eq!(rows[1].date, "2026-04-03");
+        assert_eq!(rows[1].amount_cents, -5118);
+        assert_eq!(rows[1].counterparty, "Degiro Cash Sweep Transfer");
+
+        // The EUR conversion inflow is kept (this is the euros a USD dividend lands as).
+        assert_eq!(rows[2].counterparty, "Ingreso Cambio de Divisa");
+        assert_eq!(rows[2].amount_cents, 5118);
+
+        // The USD "Dividendo"/"Retirada" rows are never imported.
+        assert!(
+            rows.iter()
+                .all(|r| r.counterparty != "Dividendo"
+                    && r.counterparty != "Retirada Cambio de Divisa"),
+            "USD rows must not be imported"
+        );
+    }
+
+    #[test]
+    fn degiro_without_header_is_a_fatal_error() {
+        let err = parse_degiro("nonsense\nno table here\n").unwrap_err();
+        assert!(err.contains("header"), "unexpected error: {err}");
+    }
+
     // --- comdirect parsing ---------------------------------------------------
 
     const COMDIRECT_SAMPLE: &str = "\
@@ -802,6 +1242,64 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
             canonical_merchant(" STADTBAECKEREI ENGELBR "),
             "STADTBAECKEREI ENGELBR"
         );
+    }
+
+    // --- Deutsche Bank parsing -----------------------------------------------
+
+    // A maxblue depot export: metadata preamble, an opening "Letzter Kontostand"
+    // line, the unquoted `Buchungstag;Wert;Umsatzart;…` header, booked rows whose
+    // signed amount lives in `Betrag`, and a closing "Kontostand" balance trailer.
+    // Depot bookings leave the counterparty column empty.
+    const DB_SAMPLE: &str = "\
+Umsätze\n\
+Konto;Filial-/Kontonummer;IBAN;Währung\n\
+maxblue Depotkonto;220 7810237 01;DE93700700240781023701;EUR\n\
+\n\
+1.1.2026 - 26.6.2026\n\
+Letzter Kontostand;;;;2.137,38;EUR\n\
+Vorgemerkte und noch nicht gebuchte Umsätze sind nicht Bestandteil dieser Übersicht.\n\
+Buchungstag;Wert;Umsatzart;Begünstigter / Auftraggeber;Verwendungszweck;IBAN / Kontonummer;BIC;Kundenreferenz;Mandatsreferenz;Gläubiger ID;Fremde Gebühren;Betrag;Abweichender Empfänger;Anzahl der Aufträge;Anzahl der Schecks;Soll;Haben;Währung\n\
+15.6.2026;15.6.2026;Wertpapiere;;INTEREST/DIVIDEND/EARNINGS QTY/NOM: 325 ISH.ST.EURO.SMALL 200 U.ETF DE INH.ANT .;;;;;;;120,09;;;;;120,09;EUR\n\
+22.1.2026;2.1.2026;Zinsen/Dividenden/Erträge;;ADVANCED LUMP SUM QTY/NOM: 1244 IS C.MSCI EMIMI U.ETF DLA FUNDS;;;;;;;-134,87;;;;-134,87;;EUR\n\
+Kontostand;26.6.2026;;;2.740,81;EUR\n";
+
+    #[test]
+    fn detects_deutsche_bank() {
+        assert_eq!(detect_format(DB_SAMPLE), BankFormat::DeutscheBank);
+    }
+
+    #[test]
+    fn parses_deutsche_bank_export() {
+        let (rows, errors) = parse(DB_SAMPLE).unwrap();
+        // The opening/closing balance lines must not surface as bad rows.
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(rows.len(), 2);
+
+        // Unpadded German date; signed amount read straight from Betrag (Haben).
+        // No counterparty named → fall back to the Umsatzart transaction type.
+        assert_eq!(rows[0].date, "2026-06-15");
+        assert_eq!(rows[0].amount_cents, 12009);
+        assert_eq!(rows[0].counterparty, "Wertpapiere");
+        assert!(
+            rows[0]
+                .description
+                .starts_with("INTEREST/DIVIDEND/EARNINGS"),
+            "description was {:?}",
+            rows[0].description
+        );
+
+        // Negative Betrag (Soll) is an expense; Umsatzart fallback again.
+        assert_eq!(rows[1].date, "2026-01-22");
+        assert_eq!(rows[1].amount_cents, -13487);
+        assert_eq!(rows[1].counterparty, "Zinsen/Dividenden/Erträge");
+    }
+
+    #[test]
+    fn deutsche_bank_without_header_is_a_fatal_error() {
+        // A file routed to the DB parser but missing the data header is a whole-file
+        // failure, not a silent zero-row parse.
+        let err = parse_db("Umsätze\nno transaction table here\n").unwrap_err();
+        assert!(err.contains("header"), "unexpected error: {err}");
     }
 
     // --- canonical parsing ---------------------------------------------------

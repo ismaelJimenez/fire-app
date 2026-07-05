@@ -132,6 +132,8 @@ export function Import({ accountId, onNavigate }: Props) {
   }
 
   const lineCount = csv.trim() ? csv.trim().split(/\r?\n/).length : 0;
+  const options = accountSelectOptions(accounts);
+  const targetPath = options.find((a) => a.id === target)?.path ?? null;
 
   return (
     <div>
@@ -162,7 +164,7 @@ export function Import({ accountId, onNavigate }: Props) {
                 value={target ?? ""}
                 onChange={(e) => setTarget(Number(e.target.value))}
               >
-                {accountSelectOptions(accounts).map((a) => (
+                {options.map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.path}
                   </option>
@@ -246,18 +248,11 @@ export function Import({ accountId, onNavigate }: Props) {
 
             <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
               <button
-                className="btn"
+                className="btn primary"
                 onClick={runPreview}
                 disabled={previewing || busy || !csv.trim()}
               >
                 {previewing ? "Checking…" : "Preview changes"}
-              </button>
-              <button
-                className="btn primary"
-                onClick={runImport}
-                disabled={busy || previewing || !csv.trim()}
-              >
-                {busy ? "Importing…" : "Import transactions"}
               </button>
               {csv && (
                 <button
@@ -288,6 +283,12 @@ export function Import({ accountId, onNavigate }: Props) {
                 </div>
                 <div>
                   ✅ Would import: <strong>{preview.imported}</strong>
+                  {targetPath && (
+                    <>
+                      {" "}
+                      into <strong>{targetPath}</strong>
+                    </>
+                  )}
                 </div>
                 <div className="muted">
                   ⏭ Would skip as duplicates: {preview.skipped_duplicates}
@@ -382,16 +383,27 @@ export function Import({ accountId, onNavigate }: Props) {
                 )}
 
                 {preview.imported > 0 && (
-                  <button
-                    className="btn primary small"
-                    style={{ marginTop: 12 }}
-                    onClick={runImport}
-                    disabled={busy}
-                  >
-                    {busy
-                      ? "Importing…"
-                      : `Import ${preview.imported} transaction(s)`}
-                  </button>
+                  <div style={{ marginTop: 12 }}>
+                    <div className="muted" style={{ marginBottom: 8 }}>
+                      Confirm to add {preview.imported} transaction(s)
+                      {targetPath ? (
+                        <>
+                          {" "}
+                          to <strong>{targetPath}</strong>
+                        </>
+                      ) : null}
+                      .
+                    </div>
+                    <button
+                      className="btn primary small"
+                      onClick={runImport}
+                      disabled={busy}
+                    >
+                      {busy
+                        ? "Importing…"
+                        : `Confirm import into ${targetPath ?? "account"}`}
+                    </button>
+                  </div>
                 )}
               </div>
             )}
@@ -468,8 +480,9 @@ export function Import({ accountId, onNavigate }: Props) {
             </p>
             <p className="muted" style={{ fontSize: 12.5 }}>
               Bank exports are detected automatically — you can drop an{" "}
-              <strong>ING-DiBa</strong> or <strong>comdirect</strong> Girokonto
-              CSV here as-is, no reformatting needed. Payees you’ve categorized
+              <strong>ING-DiBa</strong>, <strong>ING España</strong>,{" "}
+              <strong>comdirect</strong>, or <strong>Deutsche Bank</strong> CSV
+              here as-is, no reformatting needed. Payees you’ve categorized
               before are classified for you on import.
             </p>
             <button className="btn" onClick={downloadTemplate}>

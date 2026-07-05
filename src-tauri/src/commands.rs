@@ -829,6 +829,27 @@ mod tests {
     }
 
     #[test]
+    fn deutsche_bank_shared_kundenreferenz_is_not_a_duplicate() {
+        // Deutsche Bank routinely fills Kundenreferenz with a repeated placeholder
+        // ("NOTPROVIDED") on unrelated rows. These are three distinct purchases and
+        // must all import — none flagged as duplicates — even against an empty
+        // account in a dry run.
+        let csv = "\
+Umsätze\n\
+Buchungstag;Wert;Umsatzart;Begünstigter / Auftraggeber;Verwendungszweck;IBAN / Kontonummer;BIC;Kundenreferenz;Mandatsreferenz;Gläubiger ID;Fremde Gebühren;Betrag;Abweichender Empfänger;Anzahl der Aufträge;Anzahl der Schecks;Soll;Haben;Währung\n\
+15.6.2026;15.6.2026;Kartenzahlung;REWE Markt;Einkauf;;;NOTPROVIDED;;;;-12,90;;;;-12,90;;EUR\n\
+16.6.2026;16.6.2026;Kartenzahlung;ALDI;Einkauf;;;NOTPROVIDED;;;;-8,40;;;;-8,40;;EUR\n\
+17.6.2026;17.6.2026;Kartenzahlung;DM;Einkauf;;;NOTPROVIDED;;;;-5,10;;;;-5,10;;EUR\n";
+
+        let mut conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Giro");
+        let res = import_csv_into(&mut conn, acc, csv, true).unwrap();
+        assert_eq!(res.imported, 3);
+        assert_eq!(res.skipped_duplicates, 0);
+        assert!(res.preview.iter().all(|r| !r.duplicate));
+    }
+
+    #[test]
     fn import_inserts_rows_and_creates_categories() {
         let mut conn = db::open_in_memory().unwrap();
         let acc = seed_account(&conn, "Checking");

@@ -28,11 +28,14 @@ pub fn open_in_memory() -> rusqlite::Result<Connection> {
 const DEFAULT_CATEGORIES: &[&str] = &[
     "Groceries",
     "Rent",
+    "Condo Fees",
     "Utilities",
     "Transport",
     "Dining",
     "Shopping",
     "Health",
+    "Childcare",
+    "Insurance",
     "Entertainment",
     "Fees",
     "Salary",
@@ -42,6 +45,7 @@ const DEFAULT_CATEGORIES: &[&str] = &[
     "Benefits",
     "Eating Out",
     "Taxes",
+    "Tax Refund",
     "Home & DIY",
     "Income",
     "Savings",
@@ -189,12 +193,75 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // existing databases pick it up too. `INSERT OR IGNORE` makes this a no-op
         // when the row already exists — e.g. a fresh DB, or a user who added it by
         // hand — and the name's case-insensitive UNIQUE constraint enforces that.
-        conn.execute("INSERT OR IGNORE INTO categories (name) VALUES ('Other')", [])?;
+        conn.execute(
+            "INSERT OR IGNORE INTO categories (name) VALUES ('Other')",
+            [],
+        )?;
         conn.pragma_update(None, "user_version", OTHER_CATEGORY_MIGRATION)?;
+    }
+    if version < CONDO_FEES_CATEGORY_MIGRATION {
+        // "Condo Fees" joined the default set after databases had already been
+        // seeded, same as "Other" above. Back-fill it so existing databases pick
+        // it up too; `INSERT OR IGNORE` is a no-op when the row already exists.
+        conn.execute(
+            "INSERT OR IGNORE INTO categories (name) VALUES ('Condo Fees')",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", CONDO_FEES_CATEGORY_MIGRATION)?;
+    }
+    if version < TAX_REFUND_CATEGORY_MIGRATION {
+        // "Tax Refund" joined the default set after databases had already been
+        // seeded, same as the back-fills above. `INSERT OR IGNORE` is a no-op when
+        // the row already exists.
+        conn.execute(
+            "INSERT OR IGNORE INTO categories (name) VALUES ('Tax Refund')",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", TAX_REFUND_CATEGORY_MIGRATION)?;
+    }
+    if version < CHILDCARE_CATEGORY_MIGRATION {
+        // "Childcare" joined the default set after databases had already been
+        // seeded, same as the back-fills above. `INSERT OR IGNORE` is a no-op when
+        // the row already exists.
+        conn.execute(
+            "INSERT OR IGNORE INTO categories (name) VALUES ('Childcare')",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", CHILDCARE_CATEGORY_MIGRATION)?;
+    }
+    if version < INSURANCE_CATEGORY_MIGRATION {
+        // "Insurance" joined the default set after databases had already been
+        // seeded, same as the back-fills above. `INSERT OR IGNORE` is a no-op when
+        // the row already exists.
+        conn.execute(
+            "INSERT OR IGNORE INTO categories (name) VALUES ('Insurance')",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", INSURANCE_CATEGORY_MIGRATION)?;
     }
 
     Ok(())
 }
+
+/// `user_version` marking that the "Insurance" default category has been
+/// back-filled into pre-existing databases. Sits one above
+/// [`CHILDCARE_CATEGORY_MIGRATION`].
+const INSURANCE_CATEGORY_MIGRATION: i64 = 19;
+
+/// `user_version` marking that the "Childcare" default category has been
+/// back-filled into pre-existing databases. Sits one above
+/// [`TAX_REFUND_CATEGORY_MIGRATION`].
+const CHILDCARE_CATEGORY_MIGRATION: i64 = 18;
+
+/// `user_version` marking that the "Tax Refund" default category has been
+/// back-filled into pre-existing databases. Sits one above
+/// [`CONDO_FEES_CATEGORY_MIGRATION`].
+const TAX_REFUND_CATEGORY_MIGRATION: i64 = 17;
+
+/// `user_version` marking that the "Condo Fees" default category has been
+/// back-filled into pre-existing databases. Sits one above
+/// [`OTHER_CATEGORY_MIGRATION`].
+const CONDO_FEES_CATEGORY_MIGRATION: i64 = 16;
 
 /// `user_version` marking that the "Other" default category has been back-filled
 /// into pre-existing databases. Sits one above [`CANONICAL_MERCHANT_MIGRATION`].
@@ -477,10 +544,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(others, 1);
+        // init_schema runs every pending migration, so the version lands at the
+        // latest one, not just the "Other" back-fill that this test exercises.
         let version: i64 = conn
             .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, OTHER_CATEGORY_MIGRATION);
+        assert_eq!(version, INSURANCE_CATEGORY_MIGRATION);
 
         // Re-running is a no-op: no duplicate "Other".
         init_schema(&conn).unwrap();
@@ -492,6 +561,192 @@ mod tests {
             )
             .unwrap();
         assert_eq!(others, 1);
+    }
+
+    #[test]
+    fn condo_fees_category_is_backfilled_into_an_existing_database() {
+        // An existing database seeded before "Condo Fees" shipped: categories are
+        // present (so the seed-if-empty step won't run) but "Condo Fees" is absent,
+        // and the user_version predates its back-fill migration.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE categories (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+                 is_transfer INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO categories (name) VALUES ('Groceries'), ('Transfer');
+             PRAGMA user_version = 15;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        // The migration adds "Condo Fees" exactly once and bumps the version.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Condo Fees'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        // init_schema runs every pending migration, so the version lands at the
+        // latest one, not just the "Condo Fees" back-fill exercised here.
+        let version: i64 = conn
+            .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, INSURANCE_CATEGORY_MIGRATION);
+
+        // Re-running is a no-op: no duplicate "Condo Fees".
+        init_schema(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Condo Fees'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn tax_refund_category_is_backfilled_into_an_existing_database() {
+        // An existing database seeded before "Tax Refund" shipped: categories are
+        // present (so the seed-if-empty step won't run) but "Tax Refund" is absent,
+        // and the user_version predates its back-fill migration.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE categories (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+                 is_transfer INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO categories (name) VALUES ('Groceries'), ('Transfer');
+             PRAGMA user_version = 16;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        // The migration adds "Tax Refund" exactly once and bumps the version.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Tax Refund'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let version: i64 = conn
+            .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, INSURANCE_CATEGORY_MIGRATION);
+
+        // Re-running is a no-op: no duplicate "Tax Refund".
+        init_schema(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Tax Refund'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn childcare_category_is_backfilled_into_an_existing_database() {
+        // An existing database seeded before "Childcare" shipped: categories are
+        // present (so the seed-if-empty step won't run) but "Childcare" is absent,
+        // and the user_version predates its back-fill migration.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE categories (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+                 is_transfer INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO categories (name) VALUES ('Groceries'), ('Transfer');
+             PRAGMA user_version = 17;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        // The migration adds "Childcare" exactly once and bumps the version.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Childcare'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let version: i64 = conn
+            .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, INSURANCE_CATEGORY_MIGRATION);
+
+        // Re-running is a no-op: no duplicate "Childcare".
+        init_schema(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Childcare'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn insurance_category_is_backfilled_into_an_existing_database() {
+        // An existing database seeded before "Insurance" shipped: categories are
+        // present (so the seed-if-empty step won't run) but "Insurance" is absent,
+        // and the user_version predates its back-fill migration.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE categories (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+                 is_transfer INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO categories (name) VALUES ('Groceries'), ('Transfer');
+             PRAGMA user_version = 18;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        // The migration adds "Insurance" exactly once and bumps the version.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Insurance'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let version: i64 = conn
+            .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, INSURANCE_CATEGORY_MIGRATION);
+
+        // Re-running is a no-op: no duplicate "Insurance".
+        init_schema(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM categories WHERE name = 'Insurance'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

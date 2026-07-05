@@ -45,11 +45,16 @@ describe("Import", () => {
 
     const csv = "date,amount,description\n2026-01-05,-42.90,Coffee\n";
     await user.type(screen.getByRole("textbox"), csv);
+    // Importing goes through a dry-run preview, then a confirm step.
+    await user.click(screen.getByRole("button", { name: /preview changes/i }));
+    await waitFor(() =>
+      expect(api.importCsv).toHaveBeenCalledWith(1, csv, true),
+    );
     await user.click(
-      screen.getByRole("button", { name: /import transactions/i }),
+      await screen.findByRole("button", { name: /confirm import/i }),
     );
 
-    await waitFor(() => expect(api.importCsv).toHaveBeenCalledWith(1, csv));
+    await waitFor(() => expect(api.importCsv).toHaveBeenLastCalledWith(1, csv));
     expect(refreshAll).toHaveBeenCalled();
     // Summary panel reflects the backend result.
     expect(await screen.findByText("Import summary")).toBeInTheDocument();
@@ -121,7 +126,7 @@ describe("Import", () => {
     // The preview row is shown; the confirm button commits.
     expect(screen.getByText("Coffee")).toBeInTheDocument();
     await user.click(
-      screen.getByRole("button", { name: /import 1 transaction/i }),
+      screen.getByRole("button", { name: /confirm import/i }),
     );
     await waitFor(() => expect(api.importCsv).toHaveBeenLastCalledWith(1, csv));
     expect(refreshAll).toHaveBeenCalled();
@@ -129,9 +134,9 @@ describe("Import", () => {
 
   it("does not call the backend when there is nothing to import", async () => {
     renderImport();
-    // The button is disabled with an empty textarea, so the backend is untouched.
+    // The Preview button is disabled with an empty textarea, so the backend is untouched.
     expect(
-      screen.getByRole("button", { name: /import transactions/i }),
+      screen.getByRole("button", { name: /preview changes/i }),
     ).toBeDisabled();
     expect(api.importCsv).not.toHaveBeenCalled();
   });
