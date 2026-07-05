@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
+  BreakdownDirection,
   Category,
   CategorySpend,
   ClassificationRule,
@@ -95,8 +96,11 @@ export const monthlySeries = (from: string | null, to: string | null) =>
   invoke<MonthlyPoint[]>("monthly_series", { from, to });
 export const networthSeries = (from: string | null, to: string | null) =>
   invoke<NetWorthPoint[]>("networth_series", { from, to });
-export const categoryBreakdown = (from: string | null, to: string | null) =>
-  invoke<CategorySpend[]>("category_breakdown", { from, to });
+export const categoryBreakdown = (
+  from: string | null,
+  to: string | null,
+  direction: BreakdownDirection = "expense",
+) => invoke<CategorySpend[]>("category_breakdown", { from, to, direction });
 export const importCsv = (accountId: number, csvText: string, dryRun = false) =>
   invoke<ImportResult>("import_csv", { accountId, csvText, dryRun });
 export const detectBank = (csvText: string) =>

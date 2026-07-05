@@ -912,6 +912,14 @@ tr:hover .row-actions {
   border-radius: 5px;
   min-width: 2px;
 }
+/* Spending bars read light red, income bars light green. Mixing toward the
+   surface keeps the tint light in light mode and appropriately muted in dark. */
+.cat-fill.neg {
+  background: color-mix(in srgb, var(--negative) 50%, var(--surface));
+}
+.cat-fill.pos {
+  background: color-mix(in srgb, var(--positive) 50%, var(--surface));
+}
 .cat-value {
   font-size: 13px;
   font-variant-numeric: tabular-nums;

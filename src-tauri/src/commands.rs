@@ -1,7 +1,7 @@
 use crate::importers::{self, validate_date};
 use crate::models::{
-    Account, Category, CategorySpend, ClassificationRule, ImportPreviewRow, ImportResult,
-    MonthlyPoint, NetWorthPoint, Summary, Transaction,
+    Account, Category, CategorySpend, ClassificationRule, Direction, ImportPreviewRow,
+    ImportResult, MonthlyPoint, NetWorthPoint, Summary, Transaction,
 };
 use crate::AppState;
 use rusqlite::types::Value;
@@ -840,21 +840,30 @@ fn compute_networth_series(
         .collect())
 }
 
-/// Spend per category over a period, biggest spend first. See `CategorySpend`.
+/// Flow per category over a period, biggest first. `direction` selects the
+/// expense side (negative amounts, default) or the income side (positive
+/// amounts); transfers are excluded either way. See `CategorySpend`.
 #[tauri::command]
 pub fn category_breakdown(
     state: State<AppState>,
     from: Option<String>,
     to: Option<String>,
+    direction: Option<Direction>,
 ) -> CmdResult<Vec<CategorySpend>> {
     let conn = state.db.lock().map_err(e)?;
-    compute_category_breakdown(&conn, from.as_deref(), to.as_deref())
+    compute_category_breakdown(
+        &conn,
+        from.as_deref(),
+        to.as_deref(),
+        direction.unwrap_or_default(),
+    )
 }
 
 fn compute_category_breakdown(
     conn: &Connection,
     from: Option<&str>,
     to: Option<&str>,
+    direction: Direction,
 ) -> CmdResult<Vec<CategorySpend>> {
     let Some((from_ym, to_ym)) = resolve_month_bounds(conn, from, to)? else {
         return Ok(Vec::new());
@@ -862,18 +871,22 @@ fn compute_category_breakdown(
     let (lo, _) = month_day_bounds(&from_ym);
     let (_, hi) = month_day_bounds(&to_ym);
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT t.category_id, c.name, SUM(t.amount) AS total
+    // Both fragments are fixed literals chosen by the enum, never user input.
+    let (amount_filter, order) = match direction {
+        Direction::Expense => ("t.amount < 0", "ORDER BY total ASC"), // most negative first
+        Direction::Income => ("t.amount > 0", "ORDER BY total DESC"), // biggest earner first
+    };
+    let sql = format!(
+        "SELECT t.category_id, c.name, SUM(t.amount) AS total
              FROM transactions t
              LEFT JOIN categories c ON c.id = t.category_id
-             WHERE t.amount < 0
+             WHERE {amount_filter}
                AND t.date >= ?1 AND t.date <= ?2
                AND t.category_id IS NOT (SELECT id FROM categories WHERE is_transfer = 1)
              GROUP BY t.category_id
-             ORDER BY total ASC",
-        )
-        .map_err(e)?;
+             {order}"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(e)?;
     let rows = stmt
         .query_map(params![lo, hi], |r| {
             Ok(CategorySpend {
@@ -1951,7 +1964,7 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         seed_dated_tx(&conn, acc, "2026-01-09", 300000, Some(groceries)); // income, ignored
         seed_dated_tx(&conn, acc, "2026-01-10", -70000, Some(xfer)); // transfer, ignored
 
-        let rows = compute_category_breakdown(&conn, None, None).unwrap();
+        let rows = compute_category_breakdown(&conn, None, None, Direction::Expense).unwrap();
         // Ordered by biggest spend (most negative) first.
         assert_eq!(rows[0].category_name.as_deref(), Some("Rent"));
         assert_eq!(rows[0].total, -90000);
@@ -1960,6 +1973,33 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         // Uncategorized spend is reported with null id/name.
         assert_eq!(rows[2].category_id, None);
         assert_eq!(rows[2].total, -5000);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn category_breakdown_income_ranks_earnings_and_excludes_expense_and_transfers() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        let salary = cat(&conn, "Salary");
+        let interest = cat(&conn, "Interest");
+        let groceries = cat(&conn, "Groceries");
+        let xfer = transfer_cat(&conn);
+        seed_dated_tx(&conn, acc, "2026-01-05", 300000, Some(salary));
+        seed_dated_tx(&conn, acc, "2026-01-06", 20000, Some(salary));
+        seed_dated_tx(&conn, acc, "2026-01-07", 5000, Some(interest));
+        seed_dated_tx(&conn, acc, "2026-01-08", 1000, None); // uncategorized income
+        seed_dated_tx(&conn, acc, "2026-01-09", -90000, Some(groceries)); // expense, ignored
+        seed_dated_tx(&conn, acc, "2026-01-10", 70000, Some(xfer)); // transfer, ignored
+
+        let rows = compute_category_breakdown(&conn, None, None, Direction::Income).unwrap();
+        // Ordered by biggest earner (most positive) first.
+        assert_eq!(rows[0].category_name.as_deref(), Some("Salary"));
+        assert_eq!(rows[0].total, 320000);
+        assert_eq!(rows[1].category_name.as_deref(), Some("Interest"));
+        assert_eq!(rows[1].total, 5000);
+        // Uncategorized income is reported with null id/name.
+        assert_eq!(rows[2].category_id, None);
+        assert_eq!(rows[2].total, 1000);
         assert_eq!(rows.len(), 3);
     }
 }

@@ -106,11 +106,16 @@ export interface NetWorthPoint {
   balance: number;
 }
 
-/** Total spend in one category over a period (expenses only, transfers excluded).
- *  `total` is kept negative; uncategorized spend has a null id/name. */
+/** Total flow in one category over a period (transfers excluded). For the
+ *  expense breakdown only negative amounts are summed and `total` stays
+ *  negative; for the income breakdown only positive amounts are summed and
+ *  `total` stays positive. Uncategorized flow has a null id/name. */
 export interface CategorySpend {
   category_id: number | null;
   category_name: string | null;
-  /** Sum of negative amounts in this category over the period, in cents. */
+  /** Sum of same-signed amounts in this category over the period, in cents. */
   total: number;
 }
+
+/** Which side of the ledger a category breakdown reports. */
+export type BreakdownDirection = "expense" | "income";

@@ -31,6 +31,9 @@ export function Trends({ onNavigate }: Props) {
   const [monthly, setMonthly] = useState<MonthlyPoint[] | null>(null);
   const [networth, setNetworth] = useState<NetWorthPoint[] | null>(null);
   const [categories, setCategories] = useState<CategorySpend[] | null>(null);
+  const [incomeCategories, setIncomeCategories] = useState<
+    CategorySpend[] | null
+  >(null);
 
   useEffect(() => {
     const { from, to } = periodRange(period, todayIso());
@@ -38,16 +41,19 @@ export function Trends({ onNavigate }: Props) {
     setMonthly(null);
     setNetworth(null);
     setCategories(null);
+    setIncomeCategories(null);
     Promise.all([
       api.monthlySeries(from, to),
       api.networthSeries(from, to),
-      api.categoryBreakdown(from, to),
+      api.categoryBreakdown(from, to, "expense"),
+      api.categoryBreakdown(from, to, "income"),
     ])
-      .then(([m, n, c]) => {
+      .then(([m, n, c, ic]) => {
         if (!alive) return;
         setMonthly(m);
         setNetworth(n);
         setCategories(c);
+        setIncomeCategories(ic);
       })
       .catch((err) => toast(String(err), "error"));
     return () => {
@@ -189,6 +195,21 @@ export function Trends({ onNavigate }: Props) {
           </div>
 
           <div className="section-title">
+            Income by category{" "}
+            <span className="muted" style={{ fontWeight: 400, fontSize: 12.5 }}>
+              · mean / month
+            </span>
+          </div>
+          <div className="card">
+            <CategoryBreakdown
+              data={incomeCategories ?? []}
+              months={Math.max(1, kpis!.months)}
+              emptyText="No income in this period."
+              tone="pos"
+            />
+          </div>
+
+          <div className="section-title">
             Spending by category{" "}
             <span className="muted" style={{ fontWeight: 400, fontSize: 12.5 }}>
               · mean / month
@@ -198,6 +219,8 @@ export function Trends({ onNavigate }: Props) {
             <CategoryBreakdown
               data={categories ?? []}
               months={Math.max(1, kpis!.months)}
+              emptyText="No spending in this period."
+              tone="neg"
             />
           </div>
         </>
@@ -502,21 +525,27 @@ function NetWorthChart({ data }: { data: NetWorthPoint[] }) {
   );
 }
 
-/** Ranked horizontal bars of spend per category. Each row shows the category's
- *  share of total spend (bar + %) and its mean spend per month over the period.
+/** Ranked horizontal bars of flow per category. Each row shows the category's
+ *  share of the total (bar + %) and its mean per month over the period. Works
+ *  for either side of the ledger — expense totals are negative, income totals
+ *  positive; the share is a same-signed ratio so it stays positive either way.
  *  Top rows plus an "Other" roll-up. */
 function CategoryBreakdown({
   data,
   months,
+  emptyText,
+  tone,
 }: {
   data: CategorySpend[];
   months: number;
+  emptyText: string;
+  tone: "pos" | "neg";
 }) {
   const TOP = 20;
   if (data.length === 0) {
     return (
       <div className="empty" style={{ padding: 32 }}>
-        <p className="muted">No spending in this period.</p>
+        <p className="muted">{emptyText}</p>
       </div>
     );
   }
@@ -534,7 +563,8 @@ function CategoryBreakdown({
       total: rest.reduce((s, d) => s + d.total, 0),
     });
   }
-  // Totals are negative; the ratio of a category to the whole is positive.
+  // A category and the whole carry the same sign, so their ratio is positive
+  // whether this is the expense (negative) or income (positive) breakdown.
   const totalSpend = data.reduce((s, d) => s + d.total, 0) || 1;
 
   return (
@@ -547,7 +577,10 @@ function CategoryBreakdown({
               {r.name}
             </div>
             <div className="cat-track">
-              <div className="cat-fill" style={{ width: `${share}%` }} />
+              <div
+                className={`cat-fill ${tone}`}
+                style={{ width: `${share}%` }}
+              />
             </div>
             <div className="cat-pct">{Math.round(share)}%</div>
             <div className="cat-value">

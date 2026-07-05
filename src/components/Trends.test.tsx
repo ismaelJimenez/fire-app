@@ -39,6 +39,10 @@ const categories: CategorySpend[] = [
   { category_id: 1, category_name: "Rent", total: -90000 },
   { category_id: null, category_name: null, total: -10000 },
 ];
+const incomeCategories: CategorySpend[] = [
+  { category_id: 2, category_name: "Salary", total: 240000 },
+  { category_id: 3, category_name: "Interest", total: 60000 },
+];
 
 let mockStore: {
   accounts: Account[];
@@ -51,7 +55,9 @@ beforeEach(() => {
   mockStore = { accounts, toast: vi.fn() };
   vi.mocked(api.monthlySeries).mockResolvedValue(monthly);
   vi.mocked(api.networthSeries).mockResolvedValue(networth);
-  vi.mocked(api.categoryBreakdown).mockResolvedValue(categories);
+  vi.mocked(api.categoryBreakdown).mockImplementation((_from, _to, direction) =>
+    Promise.resolve(direction === "income" ? incomeCategories : categories),
+  );
 });
 
 describe("Trends", () => {
@@ -96,6 +102,19 @@ describe("Trends", () => {
     expect(screen.queryByText(formatMoney(-90000))).not.toBeInTheDocument();
   });
 
+  it("shows income by category with share (%) and mean per month", async () => {
+    render(<Trends onNavigate={onNavigate} />);
+    expect(await screen.findByText("Salary")).toBeInTheDocument();
+    expect(screen.getByText("Interest")).toBeInTheDocument();
+
+    // Salary is 240k of 300k total income → 80% share; over 2 months the mean
+    // is 120k (not the 240k absolute).
+    expect(screen.getByText("80%")).toBeInTheDocument();
+    expect(screen.getByText("20%")).toBeInTheDocument();
+    expect(screen.getByText(formatMoney(120000))).toBeInTheDocument();
+    expect(screen.getByText(formatMoney(30000))).toBeInTheDocument();
+  });
+
   it("shows a dash for savings rate when there is no income", async () => {
     vi.mocked(api.monthlySeries).mockResolvedValue([
       { month: "2026-07", income: 0, expenses: -5000 },
@@ -117,7 +136,8 @@ describe("Trends", () => {
       expect(api.monthlySeries).toHaveBeenLastCalledWith(null, null),
     );
     expect(api.networthSeries).toHaveBeenLastCalledWith(null, null);
-    expect(api.categoryBreakdown).toHaveBeenLastCalledWith(null, null);
+    expect(api.categoryBreakdown).toHaveBeenCalledWith(null, null, "expense");
+    expect(api.categoryBreakdown).toHaveBeenCalledWith(null, null, "income");
   });
 
   it("shows a no-data state when the period has no transactions", async () => {

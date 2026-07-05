@@ -128,14 +128,27 @@ pub struct NetWorthPoint {
     pub balance: i64,
 }
 
-/// Total spend in one category over a period, for the Trends view's breakdown.
+/// Total flow in one category over a period, for the Trends view's breakdown.
 ///
-/// Only expenses (negative amounts) are counted and transfers are excluded;
-/// `total` is kept negative. Uncategorized spend is reported with a null id/name.
+/// Transfers are always excluded. Which side is counted depends on the
+/// `Direction` requested: for `Expense` only negative amounts are summed and
+/// `total` stays negative; for `Income` only positive amounts are summed and
+/// `total` stays positive. Uncategorized flow is reported with a null id/name.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct CategorySpend {
     pub category_id: Option<i64>,
     pub category_name: Option<String>,
-    /// Sum of negative amounts in this category over the period, in cents.
+    /// Sum of same-signed amounts in this category over the period, in cents.
     pub total: i64,
+}
+
+/// Which side of the ledger a category breakdown reports (see `CategorySpend`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    /// Money out — negative amounts, biggest spend first.
+    #[default]
+    Expense,
+    /// Money in — positive amounts, biggest earner first.
+    Income,
 }
