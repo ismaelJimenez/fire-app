@@ -125,9 +125,7 @@ describe("Import", () => {
     ).toBeInTheDocument();
     // The preview row is shown; the confirm button commits.
     expect(screen.getByText("Coffee")).toBeInTheDocument();
-    await user.click(
-      screen.getByRole("button", { name: /confirm import/i }),
-    );
+    await user.click(screen.getByRole("button", { name: /confirm import/i }));
     await waitFor(() => expect(api.importCsv).toHaveBeenLastCalledWith(1, csv));
     expect(refreshAll).toHaveBeenCalled();
   });
