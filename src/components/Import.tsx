@@ -297,8 +297,9 @@ export function Import({ accountId, onNavigate }: Props) {
                   const newCats = [
                     ...new Set(
                       preview.preview
-                        .filter((r) => r.new_category && r.category)
-                        .map((r) => r.category as string),
+                        .filter((r) => r.new_category)
+                        .map((r) => r.category)
+                        .filter((c): c is string => c != null),
                     ),
                   ];
                   return newCats.length > 0 ? (

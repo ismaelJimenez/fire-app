@@ -718,10 +718,18 @@ pub(crate) fn validate_date(date: &str) -> Result<(), String> {
 }
 
 /// Accept a few common date layouts and normalize to YYYY-MM-DD.
+///
+/// Slash- and dot-separated dates are read day-first (`DD/MM/YYYY`), matching the
+/// European banks this app imports and what the Import UI documents. We deliberately
+/// do NOT also try a month-first (`MM/DD/YYYY`) layout: mixing the two lets one file
+/// be interpreted inconsistently row by row — `13/04` as day-first but `04/13` as
+/// month-first — silently corrupting dates for days ≤ 12. A genuinely month-first
+/// date (`04/13/2026`) instead fails here and is surfaced as a bad row.
 pub(crate) fn normalize_date(raw: &str) -> Result<String, String> {
     for fmt in [
         "%Y-%m-%d", "%d.%m.%Y", // German: 22.06.2026 (also parses 1.1.2026)
-        "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y",
+        "%d/%m/%Y", // day-first; see the doc comment on why MM/DD is excluded
+        "%Y/%m/%d", "%d-%m-%Y",
     ] {
         if let Ok(d) = NaiveDate::parse_from_str(raw, fmt) {
             return Ok(d.format("%Y-%m-%d").to_string());
@@ -880,6 +888,16 @@ mod tests {
         assert_eq!(normalize_date("2026/01/05").unwrap(), "2026-01-05");
         assert_eq!(normalize_date("22.06.2026").unwrap(), "2026-06-22"); // German
         assert_eq!(normalize_date("1.1.2026").unwrap(), "2026-01-01"); // unpadded
+    }
+
+    #[test]
+    fn slash_dates_are_day_first_and_month_first_is_rejected() {
+        // Ambiguous slash dates are always read day-first, never month-first, so a
+        // file can't be interpreted inconsistently row to row.
+        assert_eq!(normalize_date("03/04/2026").unwrap(), "2026-04-03"); // 3 April, not 4 March
+        // A genuinely month-first date is a bad row, not a silent misparse: "13" is
+        // not a valid month under the day-first layout, so it fails loudly.
+        assert!(normalize_date("04/13/2026").is_err());
     }
 
     #[test]

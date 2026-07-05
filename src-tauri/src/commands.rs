@@ -283,17 +283,23 @@ pub fn list_transactions(
     state: State<AppState>,
     account_id: Option<i64>,
     search: Option<String>,
+    limit: Option<i64>,
 ) -> CmdResult<Vec<Transaction>> {
     let conn = state.db.lock().map_err(e)?;
-    query_transactions(&conn, account_id, search.as_deref())
+    query_transactions(&conn, account_id, search.as_deref(), limit)
 }
 
 /// Core of `list_transactions`, decoupled from Tauri state so the filter/search
 /// SQL builder can be tested directly against a `Connection`.
+///
+/// `limit` caps the number of rows returned (newest first); callers that only
+/// need a preview — e.g. the dashboard's recent activity — pass a small value so
+/// the whole table isn't loaded to show a handful of rows.
 fn query_transactions(
     conn: &Connection,
     account_id: Option<i64>,
     search: Option<&str>,
+    limit: Option<i64>,
 ) -> CmdResult<Vec<Transaction>> {
     let mut sql = String::from(TX_SELECT);
     let mut clauses: Vec<String> = Vec::new();
@@ -316,6 +322,10 @@ fn query_transactions(
         sql.push_str(&clauses.join(" AND "));
     }
     sql.push_str(" ORDER BY t.date DESC, t.id DESC");
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT ?{}", values.len() + 1));
+        values.push(Value::Integer(n));
+    }
 
     let mut stmt = conn.prepare(&sql).map_err(e)?;
     let rows = stmt
@@ -350,18 +360,51 @@ pub fn create_transaction(
 pub fn update_transaction(
     state: State<AppState>,
     id: i64,
+    account_id: i64,
     date: String,
     amount: i64,
     description: String,
     category_id: Option<i64>,
 ) -> CmdResult<()> {
-    validate_date(&date)?;
     let conn = state.db.lock().map_err(e)?;
+    update_transaction_into(
+        &conn,
+        id,
+        account_id,
+        &date,
+        amount,
+        &description,
+        category_id,
+    )
+}
+
+/// Core of `update_transaction`, decoupled from Tauri state so it can be tested
+/// directly against a `Connection`.
+fn update_transaction_into(
+    conn: &Connection,
+    id: i64,
+    account_id: i64,
+    date: &str,
+    amount: i64,
+    description: &str,
+    category_id: Option<i64>,
+) -> CmdResult<()> {
+    validate_date(date)?;
+    // The edit form can move a transaction to another account, so persist
+    // account_id too; guard it the same way create_transaction does.
+    ensure_account_exists(conn, account_id)?;
     conn.execute(
         "UPDATE transactions
-         SET date = ?1, amount = ?2, description = ?3, category_id = ?4
-         WHERE id = ?5",
-        params![date, amount, description.trim(), category_id, id],
+         SET account_id = ?1, date = ?2, amount = ?3, description = ?4, category_id = ?5
+         WHERE id = ?6",
+        params![
+            account_id,
+            date,
+            amount,
+            description.trim(),
+            category_id,
+            id
+        ],
     )
     .map_err(e)?;
     Ok(())
@@ -535,7 +578,11 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
     // Money moved between the user's own accounts sits in the built-in transfer
     // category (flagged `is_transfer`, not matched by name); those rows are left
     // out of income/expense totals but still count toward balances. `IS NOT` is
-    // null-safe, so uncategorized rows (category_id IS NULL) are kept.
+    // null-safe, so uncategorized rows (category_id IS NULL) are kept — but only
+    // because the transfer category is always present (seeded on init, deletion
+    // blocked by an app guard and a DB trigger). If that subquery could ever
+    // return NULL, `category_id IS NOT NULL` would wrongly drop the uncategorized
+    // rows; the invariant is what keeps this correct.
     // Balance is every transaction plus every account's starting balance, so the
     // dashboard total matches the sum of the per-account balances.
     let total_balance: i64 = conn
@@ -590,6 +637,16 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
 // CSV import
 // ----------------------------------------------------------------------------
 
+/// Report which bank format a CSV would be parsed as, without importing anything.
+///
+/// The front end calls this when a file is loaded so it can show the detected
+/// format (and make a silent misdetection — e.g. an unrecognized bank falling back
+/// to the canonical template — visible before the user imports).
+#[tauri::command]
+pub fn detect_bank(csv_text: String) -> String {
+    importers::detect_format(&csv_text).label().to_string()
+}
+
 /// Import a CSV document into an account.
 ///
 /// The format is auto-detected (see `importers`): the app's own
@@ -601,16 +658,6 @@ fn compute_summary(conn: &Connection) -> CmdResult<Summary> {
 /// learned classification rule for the row's counterparty applies; otherwise the row
 /// lands uncategorized. Rows identical to an existing transaction (same account,
 /// date, amount and description) are skipped, so re-importing the same file is safe.
-/// Report which bank format a CSV would be parsed as, without importing anything.
-///
-/// The front end calls this when a file is loaded so it can show the detected
-/// format (and make a silent misdetection — e.g. an unrecognized bank falling back
-/// to the canonical template — visible before the user imports).
-#[tauri::command]
-pub fn detect_bank(csv_text: String) -> String {
-    importers::detect_format(&csv_text).label().to_string()
-}
-
 #[tauri::command]
 pub fn import_csv(
     state: State<AppState>,
@@ -1347,11 +1394,11 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         seed_tx(&conn, acc, "regular price");
 
         // Without escaping, "%" would match every row; escaped, it matches one.
-        let hits = query_transactions(&conn, None, Some("50%")).unwrap();
+        let hits = query_transactions(&conn, None, Some("50%"), None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].description, "50% off sale");
 
-        let plain = query_transactions(&conn, None, Some("price")).unwrap();
+        let plain = query_transactions(&conn, None, Some("price"), None).unwrap();
         assert_eq!(plain.len(), 1);
     }
 
@@ -1363,12 +1410,79 @@ Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck
         seed_tx(&conn, a, "in a");
         seed_tx(&conn, b, "in b");
 
-        assert_eq!(query_transactions(&conn, Some(a), None).unwrap().len(), 1);
-        assert_eq!(query_transactions(&conn, None, None).unwrap().len(), 2);
+        assert_eq!(
+            query_transactions(&conn, Some(a), None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            query_transactions(&conn, None, None, None).unwrap().len(),
+            2
+        );
         // Blank/whitespace search is ignored, not treated as a filter.
         assert_eq!(
-            query_transactions(&conn, None, Some("  ")).unwrap().len(),
+            query_transactions(&conn, None, Some("  "), None)
+                .unwrap()
+                .len(),
             2
+        );
+    }
+
+    #[test]
+    fn update_transaction_moves_the_row_to_another_account() {
+        let conn = db::open_in_memory().unwrap();
+        let from = seed_account(&conn, "Checking");
+        let to = seed_account(&conn, "Savings");
+        conn.execute(
+            "INSERT INTO transactions (account_id, date, amount, description)
+             VALUES (?1, '2026-01-01', -100, 'Coffee')",
+            params![from],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+
+        // Editing the account (plus other fields) actually re-homes the row.
+        update_transaction_into(&conn, id, to, "2026-02-02", -250, "Latte", None).unwrap();
+        let (acc, date, amount, desc): (i64, String, i64, String) = conn
+            .query_row(
+                "SELECT account_id, date, amount, description FROM transactions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (acc, date.as_str(), amount, desc.as_str()),
+            (to, "2026-02-02", -250, "Latte")
+        );
+
+        // A move to a non-existent account is rejected, not silently applied.
+        assert!(
+            update_transaction_into(&conn, id, 9999, "2026-02-02", -250, "Latte", None).is_err()
+        );
+    }
+
+    #[test]
+    fn query_transactions_caps_rows_at_the_limit() {
+        let conn = db::open_in_memory().unwrap();
+        let acc = seed_account(&conn, "Checking");
+        for i in 0..5 {
+            conn.execute(
+                "INSERT INTO transactions (account_id, date, amount, description)
+                 VALUES (?1, ?2, -100, 'tx')",
+                params![acc, format!("2026-01-0{}", i + 1)],
+            )
+            .unwrap();
+        }
+        // Newest first, capped to the limit.
+        let rows = query_transactions(&conn, None, None, Some(2)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].date, "2026-01-05");
+        assert_eq!(rows[1].date, "2026-01-04");
+        // No limit returns everything.
+        assert_eq!(
+            query_transactions(&conn, None, None, None).unwrap().len(),
+            5
         );
     }
 }

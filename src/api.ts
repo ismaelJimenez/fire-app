@@ -30,10 +30,15 @@ export const deleteCategory = (id: number) =>
   invoke<void>("delete_category", { id });
 
 // Transactions
-export const listTransactions = (accountId: number | null, search: string) =>
+export const listTransactions = (
+  accountId: number | null,
+  search: string,
+  limit?: number,
+) =>
   invoke<Transaction[]>("list_transactions", {
     accountId,
     search: search || null,
+    limit: limit ?? null,
   });
 
 export interface TxInput {
@@ -56,6 +61,7 @@ export const createTransaction = (t: TxInput) =>
 export const updateTransaction = (id: number, t: TxInput) =>
   invoke<void>("update_transaction", {
     id,
+    accountId: t.account_id,
     date: t.date,
     amount: t.amount,
     description: t.description,

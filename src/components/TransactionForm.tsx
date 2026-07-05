@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useStore } from "../store";
 import * as api from "../api";
 import { Modal } from "./Modal";
-import { parseAmountToCents, todayIso } from "../format";
+import { centsToInput, parseAmountToCents, todayIso } from "../format";
 import { accountSelectOptions } from "../accounts";
 import type { Transaction } from "../types";
 
@@ -32,7 +32,7 @@ export function TransactionForm({
   const [date, setDate] = useState(tx?.date ?? todayIso());
   const [sign, setSign] = useState<"-" | "+">(tx && tx.amount > 0 ? "+" : "-");
   const [amount, setAmount] = useState(
-    tx ? Math.abs(tx.amount / 100).toFixed(2) : "",
+    tx ? centsToInput(Math.abs(tx.amount)) : "",
   );
   const [description, setDescription] = useState(tx?.description ?? "");
   const [categoryId, setCategoryId] = useState<number | null>(

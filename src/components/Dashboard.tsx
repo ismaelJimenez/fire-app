@@ -15,8 +15,8 @@ export function Dashboard({ onNavigate }: Props) {
 
   useEffect(() => {
     api
-      .listTransactions(null, "")
-      .then((rows) => setRecent(rows.slice(0, 8)))
+      .listTransactions(null, "", 8)
+      .then(setRecent)
       .catch((err) => toast(String(err), "error"));
   }, [summary, toast]);
 

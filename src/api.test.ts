@@ -66,13 +66,23 @@ describe("api command/argument mapping", () => {
     expect(mockInvoke).toHaveBeenLastCalledWith("list_transactions", {
       accountId: 2,
       search: "coffee",
+      limit: null,
     });
 
-    // An empty search string is normalized to null.
+    // An empty search string is normalized to null; so is an absent limit.
     api.listTransactions(null, "");
     expect(mockInvoke).toHaveBeenLastCalledWith("list_transactions", {
       accountId: null,
       search: null,
+      limit: null,
+    });
+
+    // A limit is forwarded (dashboard recent-activity preview).
+    api.listTransactions(null, "", 8);
+    expect(mockInvoke).toHaveBeenLastCalledWith("list_transactions", {
+      accountId: null,
+      search: null,
+      limit: 8,
     });
 
     const tx = {
@@ -94,6 +104,7 @@ describe("api command/argument mapping", () => {
     api.updateTransaction(9, tx);
     expect(mockInvoke).toHaveBeenLastCalledWith("update_transaction", {
       id: 9,
+      accountId: 1,
       date: "2026-01-01",
       amount: -4290,
       description: "Groceries",

@@ -15,8 +15,8 @@ export function formatMoney(cents: number): string {
  * Parse a user-entered decimal string into integer cents.
  *
  * Uses integer arithmetic (no `num * 100`) so binary-float rounding can never
- * shift a value by a cent. Mirrors `parse_amount_cents` in the Rust backend
- * (`src-tauri/src/commands.rs`); keep the two in sync.
+ * shift a value by a cent. Mirrors `decimal_str_to_cents` in the Rust backend
+ * (`src-tauri/src/importers.rs`); keep the two in sync.
  */
 export function parseAmountToCents(value: string): number | null {
   // Strip currency symbols, spaces and thousands separators.
@@ -39,6 +39,11 @@ export function parseAmountToCents(value: string): number | null {
   let cents =
     (intPart === "" ? 0 : Number(intPart)) * 100 + digit(0) * 10 + digit(1);
   if (digit(2) >= 5) cents += 1; // round half-up on the third decimal
+
+  // Beyond the safe-integer range the cent value is no longer exact; reject it
+  // rather than return a silently-wrong amount (the Rust twin's checked_mul
+  // returns None here).
+  if (!Number.isSafeInteger(cents)) return null;
 
   return negative ? -cents : cents;
 }

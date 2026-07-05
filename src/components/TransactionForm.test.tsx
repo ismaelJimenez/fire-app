@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TransactionForm } from "./TransactionForm";
-import type { Account, Category } from "../types";
+import type { Account, Category, Transaction } from "../types";
 
 // Isolate the form from the Tauri bridge and the global store.
 vi.mock("../api");
@@ -14,6 +14,15 @@ const accounts: Account[] = [
   {
     id: 1,
     name: "Checking",
+    parent_id: null,
+    created_at: "2026-01-01",
+    opening_balance: 0,
+    balance: 0,
+    tx_count: 0,
+  },
+  {
+    id: 2,
+    name: "Savings",
     parent_id: null,
     created_at: "2026-01-01",
     opening_balance: 0,
@@ -92,5 +101,49 @@ describe("TransactionForm (create)", () => {
       expect.stringMatching(/valid non-zero amount/i),
       "error",
     );
+  });
+});
+
+describe("TransactionForm (edit)", () => {
+  const tx: Transaction = {
+    id: 9,
+    account_id: 1,
+    account_name: "Checking",
+    date: "2026-01-05",
+    amount: -4290,
+    description: "Corner store",
+    counterparty: "",
+    category_id: 7,
+    category_name: "Groceries",
+    is_verified: false,
+    is_auto_classified: false,
+    created_at: "2026-01-05",
+  };
+
+  it("persists a moved account when editing", async () => {
+    vi.mocked(api.updateTransaction).mockResolvedValue();
+    const onSaved = vi.fn();
+    const onClose = vi.fn();
+    render(
+      <TransactionForm
+        tx={tx}
+        defaultAccountId={1}
+        onClose={onClose}
+        onSaved={onSaved}
+      />,
+    );
+    const user = userEvent.setup();
+
+    // Move the transaction from Checking to Savings, then save.
+    const accountSelect = screen.getAllByRole("combobox")[0];
+    await user.selectOptions(accountSelect, "2");
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(api.updateTransaction).toHaveBeenCalledTimes(1));
+    expect(api.updateTransaction).toHaveBeenCalledWith(
+      9,
+      expect.objectContaining({ account_id: 2, amount: -4290 }),
+    );
+    expect(onSaved).toHaveBeenCalled();
   });
 });

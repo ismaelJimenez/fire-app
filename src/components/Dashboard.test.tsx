@@ -87,7 +87,8 @@ describe("Dashboard", () => {
 
     // Recent activity is loaded from the backend on mount.
     expect(await screen.findByText("Corner store")).toBeInTheDocument();
-    expect(api.listTransactions).toHaveBeenCalledWith(null, "");
+    // Only the recent-activity preview is fetched, not the whole table.
+    expect(api.listTransactions).toHaveBeenCalledWith(null, "", 8);
   });
 
   it("navigates to an account's transactions from the accounts table", async () => {
